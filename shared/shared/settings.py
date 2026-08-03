@@ -97,6 +97,12 @@ class AnthropicSecrets(BaseSettings):
     api_key: str
 
 
+class GeminiSecrets(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="GEMINI_", extra="ignore")
+
+    api_key: str
+
+
 class OrchestratorSecrets(BaseSettings):
     """Where to reach orchestrator's internal API — used by doc-ingestion-worker
     (to deliver extraction results) and notifier-scheduler (to trigger a

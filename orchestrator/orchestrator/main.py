@@ -1,14 +1,15 @@
-"""orchestrator: the single point of contact for MQTT, PostgREST, and Claude.
+"""orchestrator: the single point of contact for MQTT, PostgREST, and the LLM engine.
 
 Conversation state always lives in Postgres (via PostgREST), never in process
 memory (CLAUDE.md section 4) — that's what lets this scale to replicas.
 
 Every inbound message, whatever it contains (text, an image, a document, a
-pasted URL), goes straight into `shared.claude.run_agent_loop` with the full
-tool surface from `tools.py`. Orchestrator itself never decides what a
-message means — it only builds the content blocks, runs the loop, executes
-whatever Claude calls, and persists the result (CLAUDE.md section 10,
-"Claude drives via tool-use"). The one exception is `extract_device_data`,
+pasted URL), goes straight into `claude_client.engine.run_agent_loop` (see
+`shared/shared/engines/` — pluggable, Gemini by default) with the full tool
+surface from `tools.py`. Orchestrator itself never decides what a message
+means — it only builds the user message, runs the loop, executes whatever
+the model calls, and persists the result (CLAUDE.md section 10, "the model
+drives via tool-use"). The one exception is `extract_device_data`,
 the single async tool: it's kicked off here (not inside the loop) because it
 requires an HTTP round trip to doc-ingestion-worker that can't be awaited
 inline, and resumed here when that service calls back.
@@ -28,7 +29,7 @@ import logging
 from typing import Any
 
 from aiohttp import web
-from shared.claude import AgentTurnResult, build_content_blocks, find_tool_use, resume_agent_loop, run_agent_loop
+from shared.engines import AgentTurnResult
 from shared.internal_client import InternalApiClient
 from shared.message import DocIngestionRequest, DocIngestionResult, NormalizedMessage
 from shared.mqtt_client import ManagedMqttConnection, maintain_mqtt_connection
@@ -47,13 +48,6 @@ _mqtt = ManagedMqttConnection("orchestrator")
 _doc_ingestion_client = InternalApiClient(doc_ingestion_worker_secrets.url, "orchestrator")
 
 
-def _tools() -> list[dict[str, Any]]:
-    # Read live (not a module-level constant) so `webSearchEnabled` hot-reloads
-    # like every other appconfig setting (shared/settings.py's watch_appconfig).
-    web_tools = [tools.WEB_SEARCH_TOOL, tools.WEB_FETCH_TOOL] if appconfig.get("webSearchEnabled", True) else []
-    return [*tools.TOOL_SCHEMAS, *web_tools]
-
-
 async def handle_inbound(pg: PostgrestClient, mqtt: ManagedMqttConnection, payload: bytes) -> None:
     msg = NormalizedMessage.model_validate_json(payload)
     conversation = await get_or_create_conversation(pg, msg.channel, msg.conversation_id)
@@ -63,20 +57,19 @@ async def handle_inbound(pg: PostgrestClient, mqtt: ManagedMqttConnection, paylo
         return
 
     history: list[dict[str, Any]] = conversation["state"].get("history", [])
-    content_blocks = await build_content_blocks(msg.content, msg.attachments)
-    history = [*history, {"role": "user", "content": content_blocks}]
+    user_message = await claude_client.engine.build_user_message(msg.content, msg.attachments)
+    history = [*history, user_message]
 
     ctx = tools.ToolContext(channel=msg.channel, channel_user_id=msg.user_id)
-    result = await run_agent_loop(
-        claude_client.client,
-        claude_client.claude_model(),
+    result = await claude_client.engine.run_agent_loop(
         claude_client.SYSTEM_PROMPT,
-        _tools(),
+        tools.TOOL_SCHEMAS,
         tools.make_executor(pg, ctx),
         history,
         max_tokens=claude_client.max_tokens(),
         async_tool_names=tools.ASYNC_TOOL_NAMES,
         max_iterations_fallback=claude_client.MAX_ITERATIONS_FALLBACK,
+        web_search=appconfig.get("webSearchEnabled", True),
     )
 
     if result.done:
@@ -99,7 +92,7 @@ async def _kick_off_extraction(
     on failure — an unresolvable pending turn would just hang forever waiting
     for a callback that's never coming, so the safest thing is to leave the
     conversation exactly as it was before this message."""
-    tool_use = find_tool_use(result.messages, name="extract_device_data")
+    tool_use = claude_client.engine.find_tool_use(result.messages, name="extract_device_data")
     if tool_use is None:
         logger.error("Agent loop paused with no extract_device_data tool_use — conversation %s", conversation["id"])
         await reply(mqtt, msg, "Algo ha ido mal analizando la foto — inténtalo de nuevo.")
@@ -150,17 +143,16 @@ async def handle_doc_ingestion_result(request: web.Request) -> web.Response:
     }
 
     ctx = tools.ToolContext(channel=result.channel, channel_user_id=result.user_id)
-    agent_result = await resume_agent_loop(
-        claude_client.client,
-        claude_client.claude_model(),
+    agent_result = await claude_client.engine.resume_agent_loop(
         claude_client.SYSTEM_PROMPT,
-        _tools(),
+        tools.TOOL_SCHEMAS,
         tools.make_executor(pg, ctx),
         history,
         resolved_tool_results={pending_tool_use_id: tool_result},
         max_tokens=claude_client.max_tokens(),
         async_tool_names=tools.ASYNC_TOOL_NAMES,
         max_iterations_fallback=claude_client.MAX_ITERATIONS_FALLBACK,
+        web_search=appconfig.get("webSearchEnabled", True),
     )
 
     reply_text = agent_result.final_text or ""
@@ -194,9 +186,9 @@ def build_app(pg: PostgrestClient) -> web.Application:
 
 async def _run() -> None:
     logger.info(
-        "orchestrator starting up (PostgREST: %s, Claude model: %s)",
+        "orchestrator starting up (PostgREST: %s, engine: %s)",
         postgrest_secrets.url,
-        claude_client.claude_model(),
+        claude_client.ENGINE_NAME,
     )
     pg = PostgrestClient(postgrest_secrets.url)
 

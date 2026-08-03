@@ -17,7 +17,8 @@
       "debugLevel": "info",
       "connectTimeoutMs": 15000
     },
-    "claudeModel": "claude-sonnet-5",
+    "engine": "gemini",
+    "model": "gemini-2.5-flash",
     "maxTokens": 4096,
     "webSearchEnabled": true,
     "port": 8080
@@ -28,7 +29,8 @@
       "connectTimeoutMs": 15000
     },
     "maxConcurrency": 2,
-    "claudeModel": "claude-sonnet-5",
+    "engine": "gemini",
+    "model": "gemini-2.5-flash",
     "port": 8080
   },
   "notifier_scheduler": {

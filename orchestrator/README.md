@@ -47,7 +47,8 @@ Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecret
 
 | Variable | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | yes | Your Claude API key — see below |
+| `GEMINI_API_KEY` | yes (if `engine` is `gemini`, the default) | Your Google Gemini API key — see below |
+| `ANTHROPIC_API_KEY` | yes (if `engine` is `anthropic`) | Your Claude API key — Anthropic is still a selectable engine, just not the default anymore |
 | `POSTGREST_URL` | yes | Base URL of the PostgREST instance, e.g. `http://postgrest:3000` |
 | `DOC_INGESTION_WORKER_URL` | yes | Base URL of `doc-ingestion-worker`'s internal API, e.g. `http://doc-ingestion-worker:8080` |
 | `MQTT_HOST` | yes | MQTT broker hostname |
@@ -72,7 +73,8 @@ If any required variable is missing, the service logs an error naming it exactly
       "connectTimeoutMs": 15000
     },
     "port": 8080,
-    "claudeModel": "claude-sonnet-5",
+    "engine": "gemini",
+    "model": "gemini-2.5-flash",
     "maxTokens": 4096,
     "webSearchEnabled": true
   }
@@ -82,16 +84,18 @@ If any required variable is missing, the service logs an error naming it exactly
 | Key | Default | Description |
 |---|---|---|
 | `port` | `8080` | Port for the internal HTTP API (`/internal/doc-ingestion/result`, `/internal/reminders/check`). Not exposed to the host — reachable only from `doc-ingestion-worker`/`notifier-scheduler` over the Docker network. **Not hot-reloadable** — same reason as `web-adapter`'s `port` (the server's already bound the socket) |
-| `claudeModel` | `claude-sonnet-5` | Which Claude model to call for everything in this service |
+| `engine` | `gemini` | Which LLM engine to use — `gemini` or `anthropic` (see [`shared/shared/engines/`](../shared/shared/engines)). Only read once, at process start (needs a restart to switch) |
+| `model` | `gemini-2.5-flash` (or `claude-sonnet-5` for the `anthropic` engine) | Which model that engine calls for everything in this service |
 | `maxTokens` | `4096` | Max output tokens per agent-loop turn |
-| `webSearchEnabled` | `true` | Whether to give Claude the `web_search`/`web_fetch` tools (read live each turn — no restart needed to flip it) |
+| `webSearchEnabled` | `true` | Whether to give the model its web-search tool(s) (read live each turn — no restart needed to flip it) |
 
-All hot-reloadable — see [`shared/README.md`](../shared/README.md).
+Everything except `engine`/`model` (which are only read at construction) hot-reloads — see [`shared/README.md`](../shared/README.md).
 
-### Getting an Anthropic API key
+### Getting an API key
 
-1. Sign up / log in at the [Anthropic Console](https://console.anthropic.com/).
-2. Go to **API Keys** and create a new key.
-3. That's your `ANTHROPIC_API_KEY`. Keep an eye on usage/billing in the console — this service calls Claude on essentially every user message.
+- **Gemini (default)**: [Google AI Studio](https://aistudio.google.com/apikey) → create an API key → that's your `GEMINI_API_KEY`.
+- **Anthropic** (if you switch `engine` to `anthropic`): [Anthropic Console](https://console.anthropic.com/) → **API Keys** → create a key → that's your `ANTHROPIC_API_KEY`.
 
-> `web_search`/`web_fetch` use the `_20260209` dynamic-filtering tool variants (`tools.py`), confirmed current and compatible with `claude-sonnet-5` as of this session — double-check them against the current [`anthropic` SDK docs](https://docs.anthropic.com/) if you're reading this much later.
+Keep an eye on usage/billing for whichever provider is active — this service calls it on essentially every user message.
+
+> The Gemini engine hasn't been exercised against the live API yet (built from the `google-genai` package's type definitions + mocked-response tests) — see CLAUDE.md section 10. `web_search`/`web_fetch` on the Anthropic engine use the `_20260209` dynamic-filtering tool variants, confirmed current as of the session that added them.

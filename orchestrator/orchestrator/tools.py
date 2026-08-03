@@ -1,16 +1,18 @@
-"""The tools Claude can call during the agent loop (`shared.claude.run_agent_loop`).
+"""The tools the active LLM engine can call during the agent loop
+(`shared.engines.Engine.run_agent_loop` — see `shared/shared/engines/`).
 
-Every side-effecting action Claude decides on — saving a device, editing one,
-attaching documentation, scheduling a reminder — goes through one of these.
-Orchestrator itself makes no decisions about *when* to call them; it only
-validates shapes (via the JSON schemas below) and executes what Claude asks
-for (CLAUDE.md section 10).
+Every side-effecting action the model decides on — saving a device, editing
+one, attaching documentation, scheduling a reminder — goes through one of
+these. Orchestrator itself makes no decisions about *when* to call them; it
+only validates shapes (via the JSON schemas below) and executes what the
+model asks for (CLAUDE.md section 10). `TOOL_SCHEMAS` is plain JSON Schema —
+the same list works unchanged regardless of which engine is active.
 
 `extract_device_data` is deliberately NOT handled by `dispatch()` below — it's
 the one tool with real async work behind it (doc-ingestion-worker's
 fire-and-forget `/extract`), so `orchestrator/main.py` kicks it off directly
 when the loop pauses and injects the result back on resume (see
-`ASYNC_TOOL_NAMES` and `shared.claude.run_agent_loop`'s `async_tool_names`).
+`ASYNC_TOOL_NAMES` and `Engine.run_agent_loop`'s `async_tool_names`).
 """
 
 from __future__ import annotations
@@ -150,14 +152,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
 ]
 
-# Built-in server tools, executed by Anthropic — not by `dispatch()` below.
-# `_20260209` variants: dynamic filtering, supported on claude-sonnet-5 (the
-# model this project uses) — see CLAUDE.md known-gap #4, closed by this
-# session's move away from the older `web_search_20250305`.
-WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search"}
-WEB_FETCH_TOOL = {"type": "web_fetch_20260209", "name": "web_fetch"}
-
-
 @dataclass
 class ToolContext:
     """The bit of per-message context a tool needs beyond its own arguments —
@@ -202,7 +196,7 @@ async def dispatch(pg: PostgrestClient, ctx: ToolContext, name: str, tool_input:
 
 
 def make_executor(pg: PostgrestClient, ctx: ToolContext) -> Callable[[str, dict[str, Any]], Awaitable[Any]]:
-    """A `shared.claude.ToolExecutor` closed over this turn's `pg`/`ctx` —
+    """A `shared.engines.ToolExecutor` closed over this turn's `pg`/`ctx` —
     factored out so `orchestrator/main.py` doesn't redefine the same closure
     at both of its call sites (the normal turn and the doc-ingestion resume)."""
 

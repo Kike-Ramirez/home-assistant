@@ -148,7 +148,17 @@ This project could evolve into a Barbara use case for an industrial area's knowl
 
 **Phase:** Functional end-to-end MVP, now built around a Claude-driven tool-use agent loop (see below) instead of 4 fixed flows, **plus** completed internal-communications/configuration/deployment redesigns from earlier sessions, not yet tested against real infrastructure (broker/Postgres/PostgREST/Claude) — only compiled, linted, and tested with mocks (respx for HTTP, aiohttp TestClient/TestServer, AsyncMock/MagicMock for PostgREST/MQTT).
 
-### Conversational core rebuilt: Claude drives via tool-use (latest session)
+### LLM engine made pluggable — Gemini is now the active default (latest session)
+
+The "brain" is no longer hardcoded to Anthropic. New `shared/shared/engines/` package: `base.py` defines a provider-agnostic `Engine` protocol (`build_user_message`, `find_tool_use`, `run_agent_loop`, `resume_agent_loop`, `call_structured`); `anthropic_engine.py` holds the original Claude implementation (moved from the now-deleted `shared/shared/claude.py`, unchanged in substance); `gemini_engine.py` is new, using `google-genai`. `get_engine(name, service_name, model_name, retry_seconds)` is the one factory both `orchestrator/claude_client.py` and `doc-ingestion-worker/extractor.py` call — nothing else in the codebase imports `anthropic`/`google.genai` directly anymore.
+
+- **Selected via appconfig**: `"engine": "gemini"` (default) or `"anthropic"`, plus `"model"` (default `gemini-2.5-flash` / `claude-sonnet-5`) — both hot-reload-visible but only read at engine construction (process start), same as any other secret-adjacent setting.
+- **New secret**: `GEMINI_API_KEY` in `barbarasecrets.env`, alongside `ANTHROPIC_API_KEY` (kept — Anthropic is still a selectable engine, just not the active one).
+- **Deliberate v1 simplifications on the Gemini engine** (see its module docstring): no prompt-caching equivalent; web search maps to Gemini's `google_search` grounding tool (no separate "fetch this URL" tool like Anthropic's `web_fetch`); every attachment is downloaded and sent as inline bytes (Gemini has no `url`-source content block at all, unlike Claude's `image` blocks).
+- **`tools.py`'s `TOOL_SCHEMAS` didn't change** — plain JSON Schema, engine-agnostic; each engine converts it internally (Anthropic: used as-is; Gemini: wrapped into `FunctionDeclaration(parameters_json_schema=...)`).
+- **Not yet verified against the live Gemini API** — implemented from introspecting the installed `google-genai` package's type definitions (no API key available while writing this), then verified with mocked-response tests mirroring the existing Anthropic-engine test style. Real-traffic verification is pending, same as the rest of this project's infra.
+
+### Conversational core rebuilt: Claude drives via tool-use (previous session)
 
 The 4 fixed flows, `classify_intent`, and the `pending_action` state machine are gone. Replaced by a single Claude tool-use agent loop (`shared.claude.run_agent_loop`/`resume_agent_loop`, new) that `orchestrator` runs on every inbound message — Claude decides everything itself (onboard a device, edit one, attach documentation, troubleshoot, teach a course, recommend a replacement, schedule a reminder) by calling tools; orchestrator only executes what it's told and manages state/notifications (see the root README's design notes for the full rationale).
 

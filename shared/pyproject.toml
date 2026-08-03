@@ -9,6 +9,7 @@ dependencies = [
     "aiomqtt>=2.1",
     "postgrest>=2.19",
     "anthropic>=0.34",
+    "google-genai>=0.3",
     "httpx>=0.27",  # used directly by internal_client.py, not just transitively via postgrest
 ]
 
