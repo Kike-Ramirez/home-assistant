@@ -7,7 +7,7 @@ Built with [`aiogram`](https://docs.aiogram.dev/) v3, using **long polling** (no
 ## How it works
 
 - On startup, it starts polling Telegram for updates and, separately, connects to MQTT and subscribes to `home/outbound/telegram/+`.
-- Each incoming Telegram message (text, photo, or a `/command`) becomes a `NormalizedMessage` published to `home/inbound/telegram/<chat_id>`. Photos are sent along as their Telegram file URL (`api.telegram.org/file/...`) — that URL is public enough for Claude's vision API to fetch it directly, so no download/re-upload happens here.
+- Each incoming Telegram message (text, photo, document, or a `/command`) becomes a `NormalizedMessage` published to `home/inbound/telegram/<chat_id>`. Photos and documents are both sent along as an `Attachment` (`shared/shared/message.py`) carrying their Telegram file URL (`api.telegram.org/file/...`) plus, for documents, the MIME type and filename Telegram reports — that URL is public enough for Claude's vision/document APIs to fetch it directly, so no download/re-upload happens here. What `orchestrator` (really, Claude) does with an attachment — onboard it as a new device, treat it as an error to troubleshoot, attach it to something that already exists — isn't this adapter's concern at all.
 - Each `NormalizedMessage` arriving on `home/outbound/telegram/<chat_id>` gets sent back to that chat as a plain text message.
 - Telegram polling and the MQTT connection run as independent background tasks: if MQTT drops, it reconnects on its own (with backoff) without interrupting your ability to send messages — they just won't reach the orchestrator until the connection's back.
 

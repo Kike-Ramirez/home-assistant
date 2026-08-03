@@ -10,9 +10,22 @@ from pydantic import BaseModel, Field
 
 class MessageType(str, Enum):
     TEXT = "text"
-    PHOTO = "photo"
     COMMAND = "command"
     TELEMETRY = "telemetry"  # reserved — Barbara Standard Data Model, not used in the home MVP
+
+
+class AttachmentKind(str, Enum):
+    IMAGE = "image"
+    DOCUMENT = "document"
+    AUDIO = "audio"  # modeled for future use — no adapter captures it and Claude's Messages API
+    # has no audio content-block type, so nothing consumes it yet (CLAUDE.md section 10).
+
+
+class Attachment(BaseModel):
+    kind: AttachmentKind
+    media_type: str | None = None  # MIME type, e.g. "image/jpeg", "application/pdf"
+    url_or_data: str  # public URL or a data: base64 URI, same convention as before
+    filename: str | None = None
 
 
 class NormalizedMessage(BaseModel):
@@ -21,7 +34,7 @@ class NormalizedMessage(BaseModel):
     conversation_id: str
     type: MessageType
     content: str | None = None
-    attachments: list[str] = Field(default_factory=list)
+    attachments: list[Attachment] = Field(default_factory=list)
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 

@@ -17,7 +17,7 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
-from shared.claude import call_structured
+from shared.claude import call_structured, image_block
 
 from .config import anthropic_secrets, appconfig
 
@@ -41,20 +41,12 @@ class DeviceExtraction(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
-def _image_block(attachment: str) -> dict[str, Any]:
-    if attachment.startswith("data:"):
-        header, _, data = attachment.partition(",")
-        media_type = header.removeprefix("data:").split(";")[0] or "image/jpeg"
-        return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}
-    return {"type": "image", "source": {"type": "url", "url": attachment}}
-
-
 async def extract_device_data(attachment: str) -> dict[str, Any]:
     result = await call_structured(
         _client,
         appconfig.get("claudeModel", "claude-sonnet-5"),
         system=EXTRACTION_SYSTEM_PROMPT,
-        user_content=[_image_block(attachment), {"type": "text", "text": "Extract this device's data."}],
+        user_content=[image_block(attachment), {"type": "text", "text": "Extract this device's data."}],
         tool_name="extract_device",
         model=DeviceExtraction,
     )

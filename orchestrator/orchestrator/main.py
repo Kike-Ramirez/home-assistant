@@ -3,77 +3,134 @@
 Conversation state always lives in Postgres (via PostgREST), never in process
 memory (CLAUDE.md section 4) — that's what lets this scale to replicas.
 
+Every inbound message, whatever it contains (text, an image, a document, a
+pasted URL), goes straight into `shared.claude.run_agent_loop` with the full
+tool surface from `tools.py`. Orchestrator itself never decides what a
+message means — it only builds the content blocks, runs the loop, executes
+whatever Claude calls, and persists the result (CLAUDE.md section 10,
+"Claude drives via tool-use"). The one exception is `extract_device_data`,
+the single async tool: it's kicked off here (not inside the loop) because it
+requires an HTTP round trip to doc-ingestion-worker that can't be awaited
+inline, and resumed here when that service calls back.
+
 Runs two independent things side by side: the MQTT connection (consuming
 `home/inbound/+/+`, same as before) and a small internal HTTP API — reachable
 only on the `barbaraServices` Docker network, no host port published, no auth
 (same trusted-LAN reasoning as PostgREST without JWT and web-adapter without
 a login) — that doc-ingestion-worker and notifier-scheduler call instead of
-talking to MQTT/PostgREST themselves. See CLAUDE.md and the root README for
-why: this used to be 5 services each holding their own MQTT/PostgREST/Claude
-credentials; now only orchestrator (plus the two channel adapters, which keep
-their own MQTT connection by design) does.
+talking to MQTT/PostgREST themselves.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 from aiohttp import web
-from shared.message import DocIngestionResult, NormalizedMessage
+from shared.claude import AgentTurnResult, build_content_blocks, find_tool_use, resume_agent_loop, run_agent_loop
+from shared.internal_client import InternalApiClient
+from shared.message import DocIngestionRequest, DocIngestionResult, NormalizedMessage
 from shared.mqtt_client import ManagedMqttConnection, maintain_mqtt_connection
 from shared.postgrest_client import PostgrestClient
 from shared.settings import watch_appconfig
 
-from .claude_client import classify_intent
-from .config import SERVICE_NAME, appconfig, mqtt_secrets, postgrest_secrets, system
-from .conversation import get_or_create_conversation
-from .flows.course import handle_quiz_answer, start_course
-from .flows.onboarding import confirm_onboarding, handle_extraction_result, start_onboarding
-from .flows.replacement import handle_replacement
-from .flows.troubleshooting import handle_question
-from .messaging import reply
+from . import claude_client, tools
+from .config import SERVICE_NAME, appconfig, doc_ingestion_worker_secrets, mqtt_secrets, postgrest_secrets, system
+from .conversation import clear_keys, get_conversation_by_id, get_or_create_conversation, update_state
+from .messaging import reply, reply_raw
 from .reminders import check_reminders
 
 logger = logging.getLogger("orchestrator")
 
 _mqtt = ManagedMqttConnection("orchestrator")
+_doc_ingestion_client = InternalApiClient(doc_ingestion_worker_secrets.url, "orchestrator")
+
+
+def _tools() -> list[dict[str, Any]]:
+    # Read live (not a module-level constant) so `webSearchEnabled` hot-reloads
+    # like every other appconfig setting (shared/settings.py's watch_appconfig).
+    web_tools = [tools.WEB_SEARCH_TOOL, tools.WEB_FETCH_TOOL] if appconfig.get("webSearchEnabled", True) else []
+    return [*tools.TOOL_SCHEMAS, *web_tools]
 
 
 async def handle_inbound(pg: PostgrestClient, mqtt: ManagedMqttConnection, payload: bytes) -> None:
     msg = NormalizedMessage.model_validate_json(payload)
     conversation = await get_or_create_conversation(pg, msg.channel, msg.conversation_id)
-    pending_action = conversation["state"].get("pending_action")
 
-    if msg.type.value == "photo" and msg.attachments:
-        await start_onboarding(pg, mqtt, conversation, msg)
-        return
-    if msg.type.value == "photo":
-        await reply(mqtt, msg, "No he recibido ninguna foto adjunta — vuelve a intentarlo.")
-        return
-
-    # Pending conversation state wins as long as a flow is open and waiting
-    # for a specific reply from the user.
-    if pending_action == "awaiting_confirmation":
-        await confirm_onboarding(pg, mqtt, conversation, msg)
-        return
-    if pending_action == "awaiting_extraction":
+    if conversation["state"].get("pending_agent_turn"):
         await reply(mqtt, msg, "Sigo analizando la foto anterior, dame un momento...")
         return
-    if pending_action == "course_quiz":
-        await handle_quiz_answer(pg, mqtt, conversation, msg)
+
+    history: list[dict[str, Any]] = conversation["state"].get("history", [])
+    content_blocks = await build_content_blocks(msg.content, msg.attachments)
+    history = [*history, {"role": "user", "content": content_blocks}]
+
+    ctx = tools.ToolContext(channel=msg.channel, channel_user_id=msg.user_id)
+    result = await run_agent_loop(
+        claude_client.client,
+        claude_client.claude_model(),
+        claude_client.SYSTEM_PROMPT,
+        _tools(),
+        tools.make_executor(pg, ctx),
+        history,
+        max_tokens=claude_client.max_tokens(),
+        async_tool_names=tools.ASYNC_TOOL_NAMES,
+        max_iterations_fallback=claude_client.MAX_ITERATIONS_FALLBACK,
+    )
+
+    if result.done:
+        await update_state(pg, conversation["id"], {**conversation["state"], "history": result.messages})
+        await reply(mqtt, msg, result.final_text or "")
         return
 
-    # No open flow: delegate to Claude what the user wants (never our own
-    # keyword-matching — CLAUDE.md section 10).
-    classification = await classify_intent(msg.content or "")
+    await _kick_off_extraction(pg, mqtt, conversation, msg, result)
 
-    if classification.intent == "course":
-        await start_course(pg, mqtt, conversation, msg, classification.topic or (msg.content or ""))
-    elif classification.intent == "replacement":
-        await handle_replacement(pg, mqtt, conversation, msg)
-    else:
-        await handle_question(pg, mqtt, conversation, msg)
+
+async def _kick_off_extraction(
+    pg: PostgrestClient,
+    mqtt: ManagedMqttConnection,
+    conversation: dict[str, Any],
+    msg: NormalizedMessage,
+    result: AgentTurnResult,
+) -> None:
+    """Fires the actual `/extract` request for the `extract_device_data` tool
+    call the loop just paused on. Doesn't touch `conversation.state` at all
+    on failure — an unresolvable pending turn would just hang forever waiting
+    for a callback that's never coming, so the safest thing is to leave the
+    conversation exactly as it was before this message."""
+    tool_use = find_tool_use(result.messages, name="extract_device_data")
+    if tool_use is None:
+        logger.error("Agent loop paused with no extract_device_data tool_use — conversation %s", conversation["id"])
+        await reply(mqtt, msg, "Algo ha ido mal analizando la foto — inténtalo de nuevo.")
+        return
+
+    index = tool_use["input"].get("attachment_index", 0)
+    if not msg.attachments or index >= len(msg.attachments):
+        await reply(mqtt, msg, "No he recibido ninguna foto que analizar — vuelve a intentarlo.")
+        return
+
+    request = DocIngestionRequest(
+        conversation_id=str(conversation["id"]),
+        channel_conversation_id=msg.conversation_id,
+        channel=msg.channel,
+        user_id=msg.user_id,
+        attachment_url=msg.attachments[index].url_or_data,
+    )
+    # Fire-and-forget: doc-ingestion-worker accepts the job and replies later
+    # via POST /internal/doc-ingestion/result (see handle_doc_ingestion_result).
+    response = await _doc_ingestion_client.post("/extract", json=request.model_dump())
+    if response is None:
+        # InternalApiClient already logged the failure after its own retries.
+        await reply(mqtt, msg, "No puedo procesar la foto ahora mismo — inténtalo de nuevo en un momento.")
+        return
+
+    # `pending_agent_turn` carries the pending tool_use_id itself (not just a
+    # boolean) — resume_agent_loop resolves `resolved_tool_results` by that id
+    # once the callback below has the extraction result.
+    new_state = {**conversation["state"], "history": result.messages, "pending_agent_turn": tool_use["id"]}
+    await update_state(pg, conversation["id"], new_state)
+    await reply(mqtt, msg, result.final_text or "Recibido. Dame un momento para analizar la foto...")
 
 
 # --- Internal HTTP API (doc-ingestion-worker, notifier-scheduler) ----------
@@ -83,7 +140,41 @@ async def handle_doc_ingestion_result(request: web.Request) -> web.Response:
     pg: PostgrestClient = request.app["pg"]
     body = await request.json()
     result = DocIngestionResult.model_validate(body)
-    await handle_extraction_result(pg, _mqtt, result)
+    conversation = await get_conversation_by_id(pg, result.conversation_id)
+    history: list[dict[str, Any]] = conversation["state"].get("history", [])
+    pending_tool_use_id = conversation["state"]["pending_agent_turn"]
+
+    tool_result: Any = result.draft_device if (result.success and result.draft_device) else {
+        "success": False,
+        "error": result.error or "unknown error",
+    }
+
+    ctx = tools.ToolContext(channel=result.channel, channel_user_id=result.user_id)
+    agent_result = await resume_agent_loop(
+        claude_client.client,
+        claude_client.claude_model(),
+        claude_client.SYSTEM_PROMPT,
+        _tools(),
+        tools.make_executor(pg, ctx),
+        history,
+        resolved_tool_results={pending_tool_use_id: tool_result},
+        max_tokens=claude_client.max_tokens(),
+        async_tool_names=tools.ASYNC_TOOL_NAMES,
+        max_iterations_fallback=claude_client.MAX_ITERATIONS_FALLBACK,
+    )
+
+    reply_text = agent_result.final_text or ""
+    if not agent_result.done:
+        # Claude asked for another extraction in the same resumed turn (e.g. a
+        # message with more than one photo) — not supported yet, degrade
+        # gracefully instead of leaving the conversation stuck forever.
+        logger.warning("Agent loop paused again on resume — conversation %s (not supported, degrading)", conversation["id"])
+        reply_text = "He podido analizar la foto, pero necesito que me envíes las demás una a una."
+
+    new_state = clear_keys({**conversation["state"], "history": agent_result.messages}, "pending_agent_turn")
+    await update_state(pg, conversation["id"], new_state)
+    await reply_raw(_mqtt, result.channel, result.user_id, result.channel_conversation_id, reply_text)
+
     return web.json_response({"ok": True})
 
 
@@ -105,7 +196,7 @@ async def _run() -> None:
     logger.info(
         "orchestrator starting up (PostgREST: %s, Claude model: %s)",
         postgrest_secrets.url,
-        appconfig.get("claudeModel", "claude-sonnet-5"),
+        claude_client.claude_model(),
     )
     pg = PostgrestClient(postgrest_secrets.url)
 
@@ -129,6 +220,7 @@ async def _run() -> None:
         config_task.cancel()
         await runner.cleanup()
         await pg.aclose()
+        await _doc_ingestion_client.aclose()
 
 
 if __name__ == "__main__":

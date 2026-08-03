@@ -21,7 +21,7 @@ from pathlib import Path
 
 from aiohttp import WSMsgType, web
 
-from shared.message import MessageType, NormalizedMessage, inbound_topic, outbound_topic
+from shared.message import Attachment, AttachmentKind, MessageType, NormalizedMessage, inbound_topic, outbound_topic
 from shared.mqtt_client import ManagedMqttConnection, maintain_mqtt_connection
 from shared.settings import watch_appconfig
 
@@ -52,14 +52,18 @@ async def _publish_inbound(msg: NormalizedMessage) -> None:
 
 
 async def _handle_client_payload(user_id: str, data: dict) -> None:
-    if data.get("type") == "photo":
+    if data.get("type") == "attachment":
+        media_type = data.get("media_type") or ""
+        kind = AttachmentKind.IMAGE if media_type.startswith("image/") else AttachmentKind.DOCUMENT
         msg = NormalizedMessage(
             channel=CHANNEL,
             user_id=user_id,
             conversation_id=user_id,  # one conversation per browser session
-            type=MessageType.PHOTO,
+            type=MessageType.TEXT,
             content=data.get("caption"),
-            attachments=[data["image_data_uri"]],
+            attachments=[
+                Attachment(kind=kind, media_type=media_type or None, url_or_data=data["data_uri"], filename=data.get("filename"))
+            ],
         )
     else:
         msg = NormalizedMessage(

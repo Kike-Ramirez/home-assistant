@@ -127,6 +127,22 @@ CREATE TABLE IF NOT EXISTS home.device_compatibility (
 );
 
 -- =============================================================================
+-- 4b. Documents attached to a device (manuals, label photos, free-form notes)
+--     — the `attach_document` tool Claude can call directly on a device.
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS home.device_document (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id   text NOT NULL DEFAULT 'home',
+    device_id   uuid NOT NULL REFERENCES home.device(id) ON DELETE CASCADE,
+    kind        text NOT NULL,      -- 'photo' | 'manual' | 'note'
+    url_or_ref  text NOT NULL,      -- public URL, data: URI, or a Files API reference
+    description text,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_document_device ON home.device_document (device_id);
+
+-- =============================================================================
 -- 5. Users (role + scope, even though there's only one today)
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS home.app_user (
@@ -236,8 +252,8 @@ DECLARE
     t text;
 BEGIN
     FOREACH t IN ARRAY ARRAY['device_type','standard','device','device_standard',
-                              'device_compatibility','app_user','conversation',
-                              'message','reminder']
+                              'device_compatibility','device_document','app_user',
+                              'conversation','message','reminder']
     LOOP
         EXECUTE format('ALTER TABLE home.%I ENABLE ROW LEVEL SECURITY;', t);
     END LOOP;
@@ -253,6 +269,8 @@ CREATE POLICY tenant_isolation ON home.device_type
 CREATE POLICY tenant_isolation ON home.standard
     USING (tenant_id = home.current_tenant());
 CREATE POLICY tenant_isolation ON home.device
+    USING (tenant_id = home.current_tenant());
+CREATE POLICY tenant_isolation ON home.device_document
     USING (tenant_id = home.current_tenant());
 CREATE POLICY tenant_isolation ON home.app_user
     USING (tenant_id = home.current_tenant());

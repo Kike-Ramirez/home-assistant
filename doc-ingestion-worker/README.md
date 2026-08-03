@@ -6,7 +6,7 @@ This service has **no MQTT and no PostgREST connection** — under the "`orchest
 
 ## How it works
 
-- Exposes `POST /extract` (aiohttp, port `8080` — not exposed to the host, only reachable from `orchestrator` over the Docker network). `orchestrator` calls this whenever a user sends a photo during the device-onboarding flow.
+- Exposes `POST /extract` (aiohttp, port `8080` — not exposed to the host, only reachable from `orchestrator` over the Docker network). `orchestrator` calls this when — and only when — Claude itself decides a photo is a device label/manual worth onboarding, by calling the `extract_device_data` tool (see `orchestrator/orchestrator/tools.py`). A photo isn't automatically routed here just for being a photo — Claude might instead treat it as an error screenshot to troubleshoot, or documentation to attach to an existing device.
 - The endpoint replies `202 Accepted` immediately (fire-and-forget) and processes the extraction in a background task — a vision call can take a while, and this keeps `orchestrator` from blocking on it.
 - Each request is processed under a semaphore (`maxConcurrency` concurrent extractions at a time); the rest queue up rather than piling on Claude's API all at once.
 - The photo attachment can be either a public URL (Telegram's file URLs) or a `data:` base64 URI (from `web-adapter`, whose server usually isn't reachable outside the LAN) — this service detects which one it got and builds the right kind of image block for Claude either way.

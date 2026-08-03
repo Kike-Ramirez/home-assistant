@@ -25,10 +25,10 @@
     <button type="submit">Enviar</button>
   </form>
 
-  <form id="photoForm">
-    <input type="file" id="photoInput" accept="image/*">
+  <form id="attachmentForm">
+    <input type="file" id="attachmentInput" accept="image/*,application/pdf">
     <input type="text" id="captionInput" placeholder="Comentario (opcional)">
-    <button type="submit">Enviar foto</button>
+    <button type="submit">Enviar archivo</button>
   </form>
 
 <script>
@@ -69,9 +69,9 @@
     input.value = "";
   });
 
-  document.getElementById("photoForm").addEventListener("submit", (event) => {
+  document.getElementById("attachmentForm").addEventListener("submit", (event) => {
     event.preventDefault();
-    const fileInput = document.getElementById("photoInput");
+    const fileInput = document.getElementById("attachmentInput");
     const caption = document.getElementById("captionInput").value;
     const file = fileInput.files[0];
     if (!file) return;
@@ -79,8 +79,14 @@
     const reader = new FileReader();
     reader.onload = () => {
       // reader.result ya es un data URI completo: "data:image/jpeg;base64,...."
-      ws.send(JSON.stringify({ type: "photo", caption, image_data_uri: reader.result }));
-      appendMessage(caption ? `[foto] ${caption}` : "[foto]", "me");
+      ws.send(JSON.stringify({
+        type: "attachment",
+        caption,
+        media_type: file.type,
+        filename: file.name,
+        data_uri: reader.result,
+      }));
+      appendMessage(caption ? `[adjunto] ${caption}` : "[adjunto]", "me");
       fileInput.value = "";
       document.getElementById("captionInput").value = "";
     };

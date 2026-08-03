@@ -19,6 +19,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 
 from shared.message import (
+    Attachment,
+    AttachmentKind,
     MessageType,
     NormalizedMessage,
     inbound_topic,
@@ -46,6 +48,11 @@ async def _publish_inbound(msg: NormalizedMessage) -> None:
     await _mqtt.publish(inbound_topic(CHANNEL, msg.user_id), msg.model_dump_json())
 
 
+async def _telegram_file_url(file_id: str) -> str:
+    file = await bot.get_file(file_id)
+    return f"https://api.telegram.org/file/bot{telegram_secrets.bot_token}/{file.file_path}"
+
+
 @dp.message()
 async def on_telegram_message(message: Message) -> None:
     user_id = str(message.chat.id)
@@ -54,15 +61,31 @@ async def on_telegram_message(message: Message) -> None:
     conversation_id = str(message.chat.id)
 
     if message.photo:
-        file = await bot.get_file(message.photo[-1].file_id)
-        file_url = f"https://api.telegram.org/file/bot{telegram_secrets.bot_token}/{file.file_path}"
+        file_url = await _telegram_file_url(message.photo[-1].file_id)
         msg = NormalizedMessage(
             channel=CHANNEL,
             user_id=user_id,
             conversation_id=conversation_id,
-            type=MessageType.PHOTO,
+            type=MessageType.TEXT,
             content=message.caption,
-            attachments=[file_url],
+            attachments=[Attachment(kind=AttachmentKind.IMAGE, media_type="image/jpeg", url_or_data=file_url)],
+        )
+    elif message.document:
+        file_url = await _telegram_file_url(message.document.file_id)
+        msg = NormalizedMessage(
+            channel=CHANNEL,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            type=MessageType.TEXT,
+            content=message.caption,
+            attachments=[
+                Attachment(
+                    kind=AttachmentKind.DOCUMENT,
+                    media_type=message.document.mime_type,
+                    url_or_data=file_url,
+                    filename=message.document.file_name,
+                )
+            ],
         )
     elif message.text and message.text.startswith("/"):
         msg = NormalizedMessage(

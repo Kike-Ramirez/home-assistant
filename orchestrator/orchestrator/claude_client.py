@@ -1,206 +1,71 @@
-"""All of the orchestrator's conversational intelligence lives here.
+"""orchestrator's Claude client, the agent loop's system prompt, and reminder wording.
 
-Explicit design principle: any interpretation of what the user said (what
-they want, whether they confirmed something, which quiz option they picked)
-is delegated to Claude with structured output (`shared.claude.call_structured`)
-instead of keyword heuristics — much more robust against natural language,
-typos, or different languages.
+All conversational intelligence lives in `SYSTEM_PROMPT` + the tools in
+`orchestrator/tools.py`, driven by `shared.claude.run_agent_loop` from
+`main.py`. Nothing here decides intent or branches on it — every "what does
+the user want" decision is Claude's, made by calling (or not calling) a tool
+(CLAUDE.md section 10, "Claude drives via tool-use").
 
-NOTE: the exact name/version of the built-in web search tool
-(`web_search_20250305` as of this session) may change — check it against the
-current `anthropic` SDK docs before deploying.
+`word_reminder` is the one narrow exception that still calls Claude directly
+outside the agent loop: it words a *proactive* notification (not a reply to
+a user message), so it isn't part of any conversation turn.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from anthropic import AsyncAnthropic
-from pydantic import BaseModel
-from shared.claude import call_structured, extract_text
+from shared.claude import extract_text
 
 from .config import anthropic_secrets, appconfig
 
-_client = AsyncAnthropic(api_key=anthropic_secrets.api_key)
-
-_WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
-
-_LANGUAGE_INSTRUCTION = "Always reply in the same language the user wrote their message in."
+client = AsyncAnthropic(api_key=anthropic_secrets.api_key)
 
 
-def _claude_model() -> str:
+def claude_model() -> str:
     return appconfig.get("claudeModel", "claude-sonnet-5")
 
 
-def _web_search_tools() -> list[dict[str, Any]]:
-    return [_WEB_SEARCH_TOOL] if appconfig.get("webSearchEnabled", True) else []
+def max_tokens() -> int:
+    return appconfig.get("maxTokens", 4096)
 
 
-async def _ask(system_prompt: str, user_content: str) -> str:
-    """Free-text (non-structured) question, with `web_search` available."""
-    response = await _client.messages.create(
-        model=_claude_model(),
-        max_tokens=appconfig.get("maxTokens", 4096),
-        system=system_prompt,
-        tools=_web_search_tools(),
-        messages=[{"role": "user", "content": user_content}],
-    )
-    return extract_text(response)
+_LANGUAGE_INSTRUCTION = "Always reply in the same language the user wrote their message in."
 
-
-def _format_devices(devices: list[dict[str, Any]], *, include_standards: bool = False) -> str:
-    if not devices:
-        return "No devices registered in the house yet."
-    lines = []
-    for d in devices:
-        base = f"- {d['display_name']} (brand: {d.get('brand')}, model: {d.get('model')}, location: {d.get('isa95_area')}"
-        if include_standards:
-            standards = ", ".join(
-                entry["standard"]["name"] for entry in d.get("device_standard", []) if entry.get("standard")
-            )
-            lines.append(f"{base}, standards: {standards or 'unknown'})")
-        else:
-            lines.append(f"{base}, attributes: {d.get('attributes')})")
-    return "\n".join(lines)
-
+# Spanish, matching every other user-facing reply string in this codebase
+# (household's spoken language) — passed into shared.claude.run_agent_loop's
+# `max_iterations_fallback`, since that module is domain-agnostic infra and
+# doesn't hardcode any household-specific wording itself.
+MAX_ITERATIONS_FALLBACK = (
+    "Se me ha complicado más de la cuenta con esta petición — ¿puedes reformular lo que necesitas "
+    "o darme más detalles?"
+)
 
 # =============================================================================
-# Flow 2: troubleshooting
+# The agent loop's system prompt (used by main.py via shared.claude.run_agent_loop)
 # =============================================================================
 
-TROUBLESHOOTING_SYSTEM_PROMPT = (
-    "You're a home assistant helping the user troubleshoot appliances and "
-    "devices around the house. You're given the full inventory of devices in "
-    "the home; figure out yourself which one (if any) the question is about. "
-    "If you have its spec sheet, lean on that first. If you need more info "
-    "(manuals, forums, known fixes), use web search. Always answer with a "
-    "clear, step-by-step guide. "
+SYSTEM_PROMPT = (
+    "You're a home assistant for a single household, reachable over Telegram and a web chat. "
+    "You decide everything yourself by calling whichever tools you need — there's no separate "
+    "classification step and no one else deciding what to do with a message. "
+    "Use list_devices whenever you need the inventory (troubleshooting, replacement/purchase "
+    "recommendations, checking whether a device already exists). "
+    "Use create_device / update_device / attach_document to keep the inventory accurate. "
+    "Use extract_device_data only when a photo the user sent is genuinely a device label or manual "
+    "meant to become a new inventory entry — confirm the extracted details with the user before "
+    "calling create_device, and feel free to correct fields yourself if the user points out a mistake "
+    "instead of asking a plain yes/no question. "
+    "If a photo shows something else — an error code, a screen reading, documentation for a device "
+    "that's already registered — do that instead: help troubleshoot it, or call attach_document. "
+    "Use web_search for anything you don't already know, and web_fetch for a URL the user shared. "
+    "Use schedule_reminder whenever the user asks to be reminded about something (maintenance, a "
+    "price check, a firmware check), figuring out a sensible scheduled_at and, if they imply "
+    "recurrence, an iCal RRULE. "
+    "For anything that doesn't need a tool — troubleshooting guidance, a quick course on a topic (with "
+    "a short quiz you then grade from the conversation itself), general chat — just answer directly. "
 ) + _LANGUAGE_INSTRUCTION
-
-
-async def ask_troubleshooting(devices: list[dict[str, Any]], question: str) -> str:
-    inventory = _format_devices(devices)
-    return await _ask(TROUBLESHOOTING_SYSTEM_PROMPT, f"Home inventory:\n{inventory}\n\nQuestion: {question}")
-
-
-# =============================================================================
-# Intent classification (replaces any keyword-matching heuristic)
-# =============================================================================
-
-
-class IntentClassification(BaseModel):
-    intent: Literal["troubleshooting", "course", "replacement", "other"]
-    topic: str | None = None
-
-
-async def classify_intent(user_text: str) -> IntentClassification:
-    return await call_structured(
-        _client,
-        _claude_model(),
-        system=(
-            "Classify the intent of this message from a user talking to a home "
-            "assistant (device onboarding is handled separately; classify only "
-            "between troubleshooting, quick course, replacement/purchase, or "
-            "general chit-chat). `topic`: the course topic, or the device/"
-            "category for a replacement request; null if not applicable."
-        ),
-        user_content=user_text,
-        tool_name="classify_intent",
-        model=IntentClassification,
-    )
-
-
-# =============================================================================
-# Confirmation interpretation (flow 1: "is this correct? yes/no")
-# =============================================================================
-
-
-class ConfirmationResult(BaseModel):
-    confirmed: bool | None  # None if the reply is ambiguous
-
-
-async def interpret_confirmation(user_reply: str) -> bool | None:
-    result = await call_structured(
-        _client,
-        _claude_model(),
-        system="Determine whether the user is confirming or rejecting a proposal, in whatever language or phrasing they used.",
-        user_content=user_reply,
-        tool_name="interpret_confirmation",
-        model=ConfirmationResult,
-    )
-    return result.confirmed
-
-
-# =============================================================================
-# Flow 3: quick course + quiz
-# =============================================================================
-
-
-class QuizQuestion(BaseModel):
-    question: str
-    options: list[str]
-    correct_index: int
-
-
-class CourseResult(BaseModel):
-    lesson: str
-    questions: list[QuizQuestion]
-
-
-async def generate_course(topic: str) -> CourseResult:
-    return await call_structured(
-        _client,
-        _claude_model(),
-        system=(
-            "You're a teacher who writes short, clear crash courses on any "
-            "topic for a general audience, followed by a multiple-choice quiz "
-            "(3 to 5 questions, 2 to 4 options each) to check what stuck. "
-        )
-        + _LANGUAGE_INSTRUCTION,
-        user_content=f"Write a quick course with a quiz about: {topic}",
-        tool_name="generate_course",
-        model=CourseResult,
-        max_tokens=2048,
-    )
-
-
-class QuizAnswerResult(BaseModel):
-    selected_index: int | None  # None if it's unclear which option is meant
-
-
-async def interpret_quiz_answer(question: str, options: list[str], user_reply: str) -> int | None:
-    options_text = "\n".join(f"{i}: {opt}" for i, opt in enumerate(options))
-    result = await call_structured(
-        _client,
-        _claude_model(),
-        system=(
-            "The user is answering a multiple-choice quiz question, in free-form "
-            "language (they might say the letter, the number, the option's text, "
-            "or paraphrase it). Figure out which option they mean."
-        ),
-        user_content=f"Question: {question}\nOptions:\n{options_text}\n\nUser's reply: {user_reply}",
-        tool_name="interpret_answer",
-        model=QuizAnswerResult,
-    )
-    return result.selected_index
-
-
-# =============================================================================
-# Flow 4: replacement / new purchase
-# =============================================================================
-
-REPLACEMENT_SYSTEM_PROMPT = (
-    "You're a home assistant recommending new or replacement devices, "
-    "prioritizing compatibility with what's already in the house (same "
-    "standard/protocol, or known compatibility). Use web search to check "
-    "current popularity and pricing. Return a ranked list of options with "
-    "sources cited. "
-) + _LANGUAGE_INSTRUCTION
-
-
-async def ask_replacement(existing_devices: list[dict[str, Any]], request_text: str) -> str:
-    inventory = _format_devices(existing_devices, include_standards=True)
-    return await _ask(REPLACEMENT_SYSTEM_PROMPT, f"Devices currently in the house:\n{inventory}\n\nUser's request: {request_text}")
 
 
 # =============================================================================
@@ -219,5 +84,11 @@ REMINDER_SYSTEM_PROMPT = (
 async def word_reminder(kind: str, payload: dict[str, Any]) -> str:
     """Only called when a reminder doesn't already carry a ready-made
     `payload.message` — asks Claude to turn the raw kind/payload into a
-    proper notification."""
-    return await _ask(REMINDER_SYSTEM_PROMPT, f"Reminder kind: {kind}\nDetails: {payload}")
+    proper notification. No tools needed for this narrow, free-text task."""
+    response = await client.messages.create(
+        model=claude_model(),
+        max_tokens=max_tokens(),
+        system=REMINDER_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"Reminder kind: {kind}\nDetails: {payload}"}],
+    )
+    return extract_text(response)

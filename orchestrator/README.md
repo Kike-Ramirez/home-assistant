@@ -1,34 +1,41 @@
 # orchestrator
 
-The brain. Every inbound message from every channel ends up here; this service figures out what the user wants and runs the right flow. It's **stateless** on purpose — all conversation state lives in Postgres (via PostgREST), not in process memory, so it could scale to multiple replicas behind the same MQTT topics without any of them stepping on each other.
+The brain. Every inbound message from every channel ends up here; Claude decides what to do with it via tool calls, and this service just executes them — there's no flow dispatch or intent branching of its own. It's **stateless** on purpose — all conversation state (the Claude message transcript) lives in Postgres (via PostgREST), not in process memory, so it could scale to multiple replicas behind the same MQTT topics without any of them stepping on each other.
 
 It's also the **only service connected to MQTT, PostgREST, and the Claude API** (aside from `telegram-adapter`/`web-adapter`, which own their own MQTT connections as channel adapters, and `doc-ingestion-worker`'s narrow Claude-vision exception — see the root [README's design notes](../README.md#design-notes)). `doc-ingestion-worker` and `notifier-scheduler` have no direct connection to any of those systems; they reach `orchestrator` through the small internal HTTP API described below instead.
 
 ## How it works
 
-Consumes `home/inbound/+/+` (any channel, any user) over MQTT. For each inbound message:
+Consumes `home/inbound/+/+` (any channel, any user) over MQTT. For each inbound message, `main.py::handle_inbound`:
 
-1. **Photo attached?** → kicks off the device-onboarding flow (`POST`s to `doc-ingestion-worker`'s `/extract` to request the data, fire-and-forget).
-2. **Conversation mid-flow** (`awaiting_confirmation`, `awaiting_extraction`, `course_quiz`)? → routes to whatever that flow needs next.
-3. **Otherwise** → asks Claude to classify the intent (troubleshooting / course / replacement / other) and dispatches accordingly.
+1. Builds this turn's Claude content blocks (text + any image/document attachments — see `shared.claude.build_content_blocks`) and appends them to `conversation.state.history`.
+2. Runs `shared.claude.run_agent_loop` with the full tool list from `tools.py` and the system prompt from `claude_client.py`. Claude decides everything from here — which tool(s) to call, or none, and what to say.
+3. Persists the updated history and sends whatever Claude's final text was back to the channel.
+
+The one tool that isn't executed inline is `extract_device_data` (vision extraction via `doc-ingestion-worker`) — it needs an HTTP round trip that can't be awaited inside the loop, so calling it pauses the whole turn (`conversation.state.pending_agent_turn`) until the result comes back over the internal API below.
 
 It also runs a small internal HTTP server (aiohttp, port `8080` — not exposed to the host, only reachable over the Docker network) for the two services that used to talk over MQTT/PostgREST directly:
 
 | Endpoint | Called by | What it does |
 |---|---|---|
-| `POST /internal/doc-ingestion/result` | `doc-ingestion-worker` | Delivers the result of a `/extract` request once extraction finishes (success + draft device data, or failure + error) — replaces what used to be the `home/events/doc_ingestion_result` MQTT topic |
+| `POST /internal/doc-ingestion/result` | `doc-ingestion-worker` | Delivers the result of a `/extract` request once extraction finishes (success + draft device data, or failure + error) — resumes the paused agent-loop turn via `resume_agent_loop` |
 | `POST /internal/reminders/check` | `notifier-scheduler` | Triggers one full reminder-check cycle: reads due reminders from PostgREST, sends the ones that are ready, words the ones that need Claude's help via `word_reminder()`, and reschedules/marks-sent as appropriate. Returns `{"processed": <count>}` |
 
-None of this uses keyword matching. Every single "what did the user mean" decision — intent classification, yes/no confirmation, which quiz option they picked — goes through `shared.claude.call_structured()`: Claude is forced (via `tool_choice`) to return an object matching a Pydantic model, which gets validated, with a retry if it doesn't match. It's the same mechanism a library like `instructor` would give you, without the extra dependency weight (see the note in `claude_client.py` for why `instructor` specifically got skipped).
+None of this uses keyword matching or a fixed intent enum. **Every** decision — what to do with a message, whether a photo is a new device or something else, whether the user confirmed a draft or corrected it — is Claude choosing (or not choosing) a tool, driven by the full conversation it can see. `doc-ingestion-worker`'s vision extraction still validates its output with `shared.claude.call_structured()` (forces a tool call via `tool_choice`, validates against a Pydantic model, retries on mismatch — same mechanism a library like `instructor` would give you, without the extra dependency weight), but that's the one place structured extraction still matters; nothing in `orchestrator` classifies intent anymore.
 
-### The 4 flows
+### The tools (`tools.py`)
 
-| Flow | Module | What happens |
-|---|---|---|
-| Add a device | `flows/onboarding.py` | Photo → asks `doc-ingestion-worker` to extract data → shows a draft → confirms with the user → saves via PostgREST |
-| Troubleshooting | `flows/troubleshooting.py` | Passes Claude the **full** device inventory (no pre-filtering) plus the question; Claude decides which device it's about and whether it needs `web_search` |
-| Quick course + quiz | `flows/course.py` | Claude generates a short lesson and a multiple-choice quiz; each answer (however the user phrases it — a letter, a number, free text) is interpreted by Claude, not parsed |
-| Replacement / new purchase | `flows/replacement.py` | Passes Claude the inventory plus which standards/protocols each device supports (Zigbee, Matter, ...) and lets it use `web_search` for pricing/popularity |
+| Tool | What it does |
+|---|---|
+| `list_devices` | Returns the household's inventory (optionally with each device's supported standards/protocols) — Claude calls this itself when it needs the data, instead of it being force-fed into every prompt |
+| `create_device` | Saves a new device — typically after `extract_device_data` + the user confirming a draft, or from a plain description |
+| `update_device` | Edits an existing device — corrections, added detail |
+| `attach_document` | Attaches a manual/photo/note to an existing device (`home.device_document`) |
+| `extract_device_data` | Vision-extracts a photo already in the conversation as a device label/manual — the one asynchronous tool, see above |
+| `schedule_reminder` | Creates a `home.reminder` row for anything the user asks to be reminded about |
+| `web_search` / `web_fetch` | Anthropic's built-in server tools — current info, and fetching a URL the user shared |
+
+Troubleshooting answers, course lessons+quizzes, and replacement recommendations are **not** tools — they're just Claude's own final text, using `list_devices`/`web_search`/`web_fetch` as needed. Quiz grading works the same way: Claude re-reads its own prior turns from the conversation history rather than a tracked question index.
 
 ## Configuration
 
@@ -76,8 +83,8 @@ If any required variable is missing, the service logs an error naming it exactly
 |---|---|---|
 | `port` | `8080` | Port for the internal HTTP API (`/internal/doc-ingestion/result`, `/internal/reminders/check`). Not exposed to the host — reachable only from `doc-ingestion-worker`/`notifier-scheduler` over the Docker network. **Not hot-reloadable** — same reason as `web-adapter`'s `port` (the server's already bound the socket) |
 | `claudeModel` | `claude-sonnet-5` | Which Claude model to call for everything in this service |
-| `maxTokens` | `4096` | Max output tokens for the free-text answers (troubleshooting, replacement recommendations) |
-| `webSearchEnabled` | `true` | Whether to give Claude the `web_search` tool for troubleshooting/replacement answers |
+| `maxTokens` | `4096` | Max output tokens per agent-loop turn |
+| `webSearchEnabled` | `true` | Whether to give Claude the `web_search`/`web_fetch` tools (read live each turn — no restart needed to flip it) |
 
 All hot-reloadable — see [`shared/README.md`](../shared/README.md).
 
@@ -87,4 +94,4 @@ All hot-reloadable — see [`shared/README.md`](../shared/README.md).
 2. Go to **API Keys** and create a new key.
 3. That's your `ANTHROPIC_API_KEY`. Keep an eye on usage/billing in the console — this service calls Claude on essentially every user message.
 
-> **Heads up before deploying:** the `web_search` tool identifier used here (`web_search_20250305` in `claude_client.py`) may change over time — double-check it against the current [`anthropic` SDK docs](https://docs.anthropic.com/) before going live.
+> `web_search`/`web_fetch` use the `_20260209` dynamic-filtering tool variants (`tools.py`), confirmed current and compatible with `claude-sonnet-5` as of this session — double-check them against the current [`anthropic` SDK docs](https://docs.anthropic.com/) if you're reading this much later.

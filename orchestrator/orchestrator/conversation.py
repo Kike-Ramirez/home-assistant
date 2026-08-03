@@ -50,7 +50,6 @@ async def update_state(pg: PostgrestClient, conversation_id: str, state: dict[st
 
 
 def clear_keys(state: dict[str, Any], *keys: str) -> dict[str, Any]:
-    """New dict without the given keys — used to close out a flow and put
-    `conversation.state` back the way it was before it started (e.g. dropping
-    `pending_action`/`draft_device` once device onboarding is done)."""
+    """New dict without the given keys — used to drop `pending_agent_turn`
+    once a paused agent-loop turn resumes and completes."""
     return {k: v for k, v in state.items() if k not in keys}

@@ -8,14 +8,14 @@ Same [normalized message contract](../shared/README.md) as every other channel a
 
 - Serves a single self-contained HTML page (`static/index.html` — no build step, no JS framework) at `/`, and a WebSocket endpoint at `/ws?user_id=<uuid>`.
 - The browser generates a random `user_id` on first load (`crypto.randomUUID()`) and keeps it in `localStorage` — that's the whole "session" model. **There's no login.** This is a deliberate simplicity choice for a trusted home LAN — see the note in the code and in the root README's design notes. If this node ever became reachable from outside your LAN, you'd want to add at least a shared password before exposing it like this.
-- Text messages and photo uploads (read client-side as a base64 data URI via `FileReader`) both go out over the same WebSocket as a small JSON payload, get turned into a `NormalizedMessage`, and published to `home/inbound/web/<user_id>`.
+- Text messages and file uploads (any type — image, PDF, whatever; read client-side as a base64 data URI via `FileReader`) both go out over the same WebSocket as a small JSON payload, get turned into a `NormalizedMessage` with an `Attachment` (kind `image` or `document`, decided from the file's MIME type), and published to `home/inbound/web/<user_id>`.
 - Messages on `home/outbound/web/<user_id>` get pushed back down the matching WebSocket connection, if one's open.
 - The HTTP/WebSocket server and the MQTT connection run as independent background tasks — same as `telegram-adapter` — so a dropped MQTT connection doesn't kill open browser sessions.
 - No message queue: if nobody's got the page open when a reply comes back, it's dropped. That's an acceptable trade for a fallback/debugging channel — it's not the primary way anyone's expected to use this day-to-day.
 
-### Why photos here work differently from Telegram
+### Why attachments here work differently from Telegram
 
-`telegram-adapter` can just hand Claude a public `api.telegram.org` URL. This server usually only lives on the LAN, so Claude's servers couldn't fetch a URL pointing at it — instead, the browser sends the photo as a `data:image/...;base64,...` URI, and `doc-ingestion-worker` detects that and sends the image inline instead of as a URL. Same underlying flow, different transport for the image.
+`telegram-adapter` can just hand Claude a public `api.telegram.org` URL. This server usually only lives on the LAN, so Claude's servers couldn't fetch a URL pointing at it — instead, the browser sends the file as a `data:<mime>;base64,...` URI directly in the attachment. `shared.claude.build_content_blocks` (used by `orchestrator`) handles both transports transparently: a base64 image/document goes straight into the content block, while a document that's still a URL (Telegram's case) gets downloaded and base64-encoded there instead, since Claude's `document` content block — unlike `image` — has no `url` source type.
 
 ## Configuration
 
@@ -57,4 +57,4 @@ No external API credentials needed — that's the point of this being the fallba
 
 ## Trying it out
 
-Once the service is running, open `http://<host>:8090` in a browser. Type a message, hit send, or attach a photo to test the device-onboarding flow.
+Once the service is running, open `http://<host>:8090` in a browser. Type a message, hit send, or attach a photo/document — what happens next (onboarding, troubleshooting, attaching it to an existing device) is Claude's call, not this adapter's.
