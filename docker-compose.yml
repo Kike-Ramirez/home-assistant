@@ -1,56 +1,38 @@
 services:
   telegram-adapter:
-    build:
-      context: .
-      dockerfile: Dockerfile.service
-      args:
-        SERVICE: telegram-adapter
-        MODULE: telegram_adapter
+    image: kikeramirez/home-assistant-telegram-adapter:latest
     networks:
       - barbaraServices
 
   web-adapter:
-    build:
-      context: .
-      dockerfile: Dockerfile.service
-      args:
-        SERVICE: web-adapter
-        MODULE: web_adapter
+    image: kikeramirez/home-assistant-web-adapter:latest
     ports:
       - "8090:8090"
     networks:
       - barbaraServices
 
   orchestrator:
-    build:
-      context: .
-      dockerfile: Dockerfile.service
-      args:
-        SERVICE: orchestrator
-        MODULE: orchestrator
+    image: kikeramirez/home-assistant-orchestrator:latest
     networks:
       - barbaraServices
 
   doc-ingestion-worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.service
-      args:
-        SERVICE: doc-ingestion-worker
-        MODULE: doc_ingestion_worker
+    image: kikeramirez/home-assistant-doc-ingestion-worker:latest
     networks:
       - barbaraServices
 
   notifier-scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.service
-      args:
-        SERVICE: notifier-scheduler
-        MODULE: notifier_scheduler
+    image: kikeramirez/home-assistant-notifier-scheduler:latest
     networks:
       - barbaraServices
 
+# No `build:` here on purpose: on a Barbara node, these images are pulled
+# ready-made from Docker Hub instead of built on the node itself. Build and
+# push them with ./build-and-push-images.sh (repo root) before deploying —
+# see the root README's "Publishing images to Docker Hub" section.
+# docker-compose-local.yml is the one that still builds from Dockerfile.service
+# directly, for local debugging.
+#
 # The MQTT broker (Mosquitto), Postgres, PostgREST, InfluxDB, and Grafana are
 # NOT declared here: they're Barbara Marketplace services, already deployed
 # on the node. Our services connect to them by hostname/Barbara's internal

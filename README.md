@@ -101,9 +101,10 @@ Monorepo, `uv` workspace. One Python package per service, plus `shared`:
 ├── db/schema.sql           # Postgres DDL (schema `home`, served by PostgREST)
 ├── appconfigDev/           # local-only: appconfig.json (app-level) + global.json (device-level, unused today)
 ├── barbarasecrets.env      # local-only: every service's secrets, in one file
-├── docker-compose.yml      # for the Barbara edge node — no secrets/appconfig here, the platform injects them
-├── docker-compose-local.yml # for local debugging — same services, mounting appconfigDev/ and barbarasecrets.env
+├── docker-compose.yml      # for the Barbara edge node — pulls pre-built images from Docker Hub, no build/secrets/appconfig here
+├── docker-compose-local.yml # for local debugging — builds from source, mounting appconfigDev/ and barbarasecrets.env
 ├── Dockerfile.service      # one generic Dockerfile for all 5 services, parameterized via build args
+├── build-and-push-images.sh # builds + tags + pushes all 5 images to Docker Hub — see below
 └── pyproject.toml          # workspace root
 ```
 
@@ -143,6 +144,53 @@ You don't need a Barbara node to try this out — `docker-compose-local.yml` run
 5. **Tweak config without rebuilding**: `appconfigDev/appconfig.json` (mounted read-only at `/appconfig/appconfig.json`) is watched and reloaded live — change any service's `debugLevel`, timeouts, or other settings and it picks it up within ~10s, no restart. `barbarasecrets.env` is the one thing that *does* need a restart to take effect (normal env var behavior).
 
 If you're developing without Docker at all: it's a standard `uv` workspace, so `uv sync` at the repo root sets up every package, and `uv run python -m <package>.main` runs any one service directly (point `ANTHROPIC_API_KEY`/`MQTT_*`/whatever it needs at real values via env vars, and `/appconfig/appconfig.json` at a local copy of `appconfigDev/appconfig.json` if you want non-default settings).
+
+## Deploying to a Barbara node
+
+`docker-compose.yml` (the one Barbara actually uses) doesn't build anything — it pulls pre-built images from Docker Hub, one repository per service:
+
+| Service | Docker Hub repository | URL |
+|---|---|---|
+| `telegram-adapter` | `kikeramirez/home-assistant-telegram-adapter` | https://hub.docker.com/r/kikeramirez/home-assistant-telegram-adapter |
+| `web-adapter` | `kikeramirez/home-assistant-web-adapter` | https://hub.docker.com/r/kikeramirez/home-assistant-web-adapter |
+| `orchestrator` | `kikeramirez/home-assistant-orchestrator` | https://hub.docker.com/r/kikeramirez/home-assistant-orchestrator |
+| `doc-ingestion-worker` | `kikeramirez/home-assistant-doc-ingestion-worker` | https://hub.docker.com/r/kikeramirez/home-assistant-doc-ingestion-worker |
+| `notifier-scheduler` | `kikeramirez/home-assistant-notifier-scheduler` | https://hub.docker.com/r/kikeramirez/home-assistant-notifier-scheduler |
+
+`docker-compose-local.yml` is unaffected by any of this — it still builds straight from `Dockerfile.service` for local debugging, always with your latest local changes, never from Docker Hub.
+
+### Publishing images to Docker Hub
+
+`build-and-push-images.sh` (repo root) builds from `Dockerfile.service` — same one `docker-compose-local.yml` uses — and pushes to the 5 repositories above. Log in once per machine/session (always interactive, never scripted):
+
+```bash
+docker login
+```
+
+**All 5 at once** (the common case — e.g. after a change to `shared/`, which every service depends on):
+
+```bash
+./build-and-push-images.sh
+```
+
+**Just one or a few**, by service directory name — much faster when only that service changed:
+
+```bash
+./build-and-push-images.sh orchestrator
+./build-and-push-images.sh orchestrator web-adapter    # a few, space-separated
+```
+
+Valid names: `telegram-adapter`, `web-adapter`, `orchestrator`, `doc-ingestion-worker`, `notifier-scheduler` (an unknown name fails fast with that list, instead of silently building nothing). Combine with either mode:
+
+```bash
+./build-and-push-images.sh --build-only                    # build all 5, push none — sanity-check first
+./build-and-push-images.sh --build-only orchestrator        # same, but just one service
+DOCKERHUB_USER=someoneelse TAG=0.1.0 ./build-and-push-images.sh orchestrator   # override account/tag too
+```
+
+The script never touches your credentials — it just checks you're already logged in and tells you to run `docker login` if a push gets rejected.
+
+Once the images are pushed, deploying/updating on the Barbara node is just re-pulling: `docker compose -f docker-compose.yml pull && docker compose -f docker-compose.yml up -d` (or however Barbara's own deployment flow triggers a pull — check the platform's docs for the exact mechanism on your node).
 
 ## Design notes
 
