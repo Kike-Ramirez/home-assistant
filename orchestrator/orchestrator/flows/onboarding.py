@@ -1,7 +1,8 @@
 """Flow 1: device onboarding.
 
-photo -> doc-ingestion-worker (Claude vision extraction) -> confirmation with
-the user -> saved to the registry (PostgREST).
+photo -> doc-ingestion-worker (Claude vision extraction, over its `/extract`
+HTTP endpoint) -> confirmation with the user -> saved to the registry
+(PostgREST).
 
 Note: the reply strings below are intentionally left in Spanish — they're
 what the assistant actually says to the household, and replies are meant to
@@ -13,15 +14,20 @@ from __future__ import annotations
 
 from typing import Any
 
-import aiomqtt
-
-from shared.message import DOC_INGESTION_REQUEST_TOPIC, DocIngestionRequest, DocIngestionResult, NormalizedMessage
+from shared.internal_client import InternalApiClient
+from shared.message import DocIngestionRequest, DocIngestionResult, NormalizedMessage
+from shared.mqtt_client import ManagedMqttConnection
 from shared.postgrest_client import PostgrestClient
 
 from ..claude_client import interpret_confirmation
+from ..config import doc_ingestion_worker_secrets
 from ..conversation import clear_keys, get_conversation_by_id, update_state
 from ..messaging import reply, reply_raw
 from ..registry import create_device
+
+# orchestrator is the one firing the extraction job — same "one client per
+# external dependency, created once" pattern as claude_client.py.
+_doc_ingestion_client = InternalApiClient(doc_ingestion_worker_secrets.url, "orchestrator")
 
 
 def _format_draft(draft: dict[str, Any]) -> str:
@@ -37,7 +43,7 @@ def _format_draft(draft: dict[str, Any]) -> str:
 
 async def start_onboarding(
     pg: PostgrestClient,
-    mqtt: aiomqtt.Client,
+    mqtt: ManagedMqttConnection,
     conversation: dict[str, Any],
     msg: NormalizedMessage,
 ) -> None:
@@ -48,14 +54,23 @@ async def start_onboarding(
         user_id=msg.user_id,
         attachment_url=msg.attachments[0],
     )
-    await mqtt.publish(DOC_INGESTION_REQUEST_TOPIC, payload=request.model_dump_json(), qos=1)
+    # Fire-and-forget: doc-ingestion-worker accepts the job and replies later
+    # via POST /internal/doc-ingestion/result — same async decoupling MQTT used
+    # to give us, just over HTTP now (see shared/internal_client.py).
+    response = await _doc_ingestion_client.post("/extract", json=request.model_dump())
+
+    if response is None:
+        # InternalApiClient already logged the failure after its own retries —
+        # degrade gracefully instead of leaving the user hanging.
+        await reply(mqtt, msg, "No puedo procesar la foto ahora mismo — inténtalo de nuevo en un momento.")
+        return
 
     new_state = {**conversation["state"], "pending_action": "awaiting_extraction"}
     await update_state(pg, conversation["id"], new_state)
     await reply(mqtt, msg, "Recibido. Dame un momento para analizar la foto...")
 
 
-async def handle_extraction_result(pg: PostgrestClient, mqtt: aiomqtt.Client, result: DocIngestionResult) -> None:
+async def handle_extraction_result(pg: PostgrestClient, mqtt: ManagedMqttConnection, result: DocIngestionResult) -> None:
     conversation = await get_conversation_by_id(pg, result.conversation_id)
 
     if not result.success or not result.draft_device:
@@ -83,12 +98,12 @@ async def handle_extraction_result(pg: PostgrestClient, mqtt: aiomqtt.Client, re
 
 async def confirm_onboarding(
     pg: PostgrestClient,
-    mqtt: aiomqtt.Client,
+    mqtt: ManagedMqttConnection,
     conversation: dict[str, Any],
     msg: NormalizedMessage,
 ) -> None:
     draft = conversation["state"].get("draft_device")
-    confirmed = interpret_confirmation(msg.content or "")
+    confirmed = await interpret_confirmation(msg.content or "")
 
     if confirmed is None:
         # Ambiguous reply: keep the draft around so confirmation can be retried.

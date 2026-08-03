@@ -39,37 +39,40 @@ flowchart LR
     ORCH -- MQTT outbound --> TA
     ORCH -- MQTT outbound --> WA
 
-    ORCH -- photo received --> DIW[doc-ingestion-worker]
-    DIW -- extraction result --> ORCH
+    ORCH -- "POST /extract" --> DIW[doc-ingestion-worker]
+    DIW -- "POST /internal/doc-ingestion/result" --> ORCH
+    DIW -- vision --> CLAUDE[Claude API]
+
+    SCHED[notifier-scheduler] -- "POST /internal/reminders/check" --> ORCH
 
     ORCH <-- REST --> PGRST[(PostgREST)]
     PGRST <--> PG[(Postgres)]
-    ORCH -- tool calls --> CLAUDE[Claude API]
-    DIW -- vision --> CLAUDE
-
-    SCHED[notifier-scheduler] -- reads due reminders --> PGRST
-    SCHED -- MQTT outbound / events --> ORCH
+    ORCH -- tool calls --> CLAUDE
 
     MQTT{{MQTT broker<br/>Mosquitto}}
     TA -.-> MQTT
     WA -.-> MQTT
     ORCH -.-> MQTT
-    DIW -.-> MQTT
-    SCHED -.-> MQTT
 ```
 
-Everything talks to everything else over **MQTT** — no service calls another service's API directly. Channel adapters (Telegram, web) are dumb translators: they turn whatever the channel gives them into a normalized message and publish it, and turn outbound normalized messages back into channel-native replies. The `orchestrator` never knows or cares which channel a message came from — that's the whole point of the adapter pattern, and it's what makes adding a new channel (WhatsApp, Slack, voice, whatever) a matter of writing one more adapter, not touching the brain.
+`orchestrator` is the only service with connections to MQTT, PostgREST, and (for the conversational flows) the Claude API — it's the single owner of every external/shared connection except the two named exceptions below. Everything else routes through it over a small internal HTTP API instead of touching those systems directly:
+
+- **Channel adapters** (`telegram-adapter`, `web-adapter`) are the one deliberate exception on the inbound/outbound side: each manages its own Telegram/WebSocket connection *and* its own MQTT connection, publishing/subscribing directly to `home/inbound/<channel>/*` and `home/outbound/<channel>/*`. They're dumb translators — they turn whatever the channel gives them into a normalized message and publish it, and turn outbound normalized messages back into channel-native replies. The `orchestrator` never knows or cares which channel a message came from.
+- **`doc-ingestion-worker`** is the other deliberate exception: it keeps its own Claude client for vision extraction (see [Design notes](#design-notes) for why), but has no MQTT or PostgREST connection at all — `orchestrator` calls its `POST /extract` directly, and it calls back to `orchestrator`'s `POST /internal/doc-ingestion/result` when done, since a vision extraction can take a while and shouldn't block the caller.
+- **`notifier-scheduler`** has no MQTT or PostgREST connection either — it's reduced to a cron heartbeat that calls `orchestrator`'s `POST /internal/reminders/check` on a timer. It still exists as its own service because it owns something `orchestrator` doesn't: a Postgres-backed APScheduler jobstore, so scheduled ticks survive a restart independently of `orchestrator`'s process lifecycle.
+
+Adding a new channel (WhatsApp, Slack, voice, whatever) is still just a matter of writing one more adapter that speaks the same MQTT contract — that part of the design is unchanged.
 
 ## Services
 
 | Service | What it does | Notes |
 |---|---|---|
-| [`telegram-adapter`](./telegram-adapter) | Telegram ↔ normalized message | `aiogram` v3, long polling — no port exposed, no webhook/TLS to manage |
-| [`web-adapter`](./web-adapter) | Minimal web chat ↔ normalized message | Always-on fallback channel — no Telegram account needed. The only service with an exposed port (8090) |
-| [`orchestrator`](./orchestrator) | The brain: routes by channel/intent, runs all 4 flows | Stateless — conversation state lives in Postgres, not in the process, so it can scale to replicas |
-| [`doc-ingestion-worker`](./doc-ingestion-worker) | Extracts device data from a photo via Claude vision | Own queue, bounded concurrency — never blocks the normal chat flow |
-| [`notifier-scheduler`](./notifier-scheduler) | Checks due reminders, publishes alerts | `APScheduler` with a Postgres-backed jobstore, survives restarts |
-| [`shared`](./shared) | Common library: message contract, MQTT/PostgREST clients, config/logging, structured Claude calls | Not a deployable service — a workspace package the others depend on |
+| [`telegram-adapter`](./telegram-adapter) | Telegram ↔ normalized message | `aiogram` v3, long polling — no port exposed, no webhook/TLS to manage. Owns its own MQTT connection (exception #1) |
+| [`web-adapter`](./web-adapter) | Minimal web chat ↔ normalized message | Always-on fallback channel — no Telegram account needed. The only service with an exposed port (8090). Owns its own MQTT connection (exception #2) |
+| [`orchestrator`](./orchestrator) | The brain: routes by channel/intent, runs all 4 flows | Stateless — conversation state lives in Postgres, not in the process, so it can scale to replicas. The only service connected to MQTT/PostgREST/Claude for everything that isn't one of the two exceptions above; exposes a small internal HTTP API for `doc-ingestion-worker` and `notifier-scheduler` |
+| [`doc-ingestion-worker`](./doc-ingestion-worker) | Extracts device data from a photo via Claude vision | No MQTT, no PostgREST — called via `POST /extract`, calls back via `POST /internal/doc-ingestion/result`. Own bounded-concurrency queue so a slow extraction never blocks the chat flow. Keeps its own Claude client (the one narrow exception to full centralization — see Design notes) |
+| [`notifier-scheduler`](./notifier-scheduler) | Cron heartbeat: pings `orchestrator` to check due reminders | No MQTT, no PostgREST — just `APScheduler` with a Postgres-backed jobstore (its one remaining reason to be a separate process) calling `POST /internal/reminders/check` |
+| [`shared`](./shared) | Common library: message contract, MQTT/PostgREST clients, internal HTTP client, config/logging, structured Claude calls | Not a deployable service — a workspace package the others depend on |
 
 ## External services (not part of this repo)
 
@@ -96,17 +99,29 @@ Monorepo, `uv` workspace. One Python package per service, plus `shared`:
 ├── doc-ingestion-worker/
 ├── notifier-scheduler/
 ├── db/schema.sql           # Postgres DDL (schema `home`, served by PostgREST)
+├── appconfigDev/           # local-only: appconfig.json (app-level) + global.json (device-level, unused today)
+├── barbarasecrets.env      # local-only: every service's secrets, in one file
 ├── docker-compose.yml      # for the Barbara edge node — no secrets/appconfig here, the platform injects them
-├── docker-compose-local.yml # for local debugging — same services, but with env_file/volumes so it runs standalone
+├── docker-compose-local.yml # for local debugging — same services, mounting appconfigDev/ and barbarasecrets.env
 ├── Dockerfile.service      # one generic Dockerfile for all 5 services, parameterized via build args
 └── pyproject.toml          # workspace root
 ```
 
 Each service has its own `README.md` (linked in the table above) with its specific config, required secrets, and how to get credentials for whatever external API it needs.
 
+## Configuration: one shared appconfig + one shared secrets file
+
+This project follows Barbara's own conventions exactly — see the [`boilerplate_01_python`](https://github.com/Barbaraedge/training_barbara_apps_development/tree/main/boilerplate_01_python) reference project — rather than inventing a per-service scheme:
+
+- **`appconfigDev/appconfig.json`** — ONE JSON file for the whole app, one top-level key per service (`orchestrator`, `telegram_adapter`, ...), mounted read-only at `/appconfig/appconfig.json` in every container. This is Barbara's "Appconfig Application Level".
+- **`appconfigDev/global.json`** — Barbara's "Appconfig Device Level", mounted at `/appconfig/global.json`. Not consumed by any service yet (nothing here needs device-wide config today), included so the file exists and there's a `load_global_config()` helper in `shared/shared/settings.py` ready for whenever something does.
+- **`barbarasecrets.env`** — ONE env file with every service's secrets, injected identically into every container via `env_file:` in `docker-compose-local.yml`. This matches how Barbara Secrets actually work on a real node: one store per app/project, not one per docker-compose service — a container just reads whichever variables it needs and ignores the rest.
+
+On a real Barbara node (`docker-compose.yml`), the platform injects both of these the same way, at the same paths — nothing in this project's code needs to know or care whether it's running locally or deployed.
+
 ## Running it locally
 
-You don't need a Barbara node to try this out — `docker-compose-local.yml` runs everything standalone, including a jobstore-only Postgres reachable at `postgresql`. You still need your **own** MQTT broker, Postgres+PostgREST, and API keys, since those aren't bundled (see the table above and each service's README for exact credentials).
+You don't need a Barbara node to try this out — `docker-compose-local.yml` runs everything standalone, including a jobstore-only Postgres reachable at `postgresql`. You still need your **own** MQTT broker, Postgres+PostgREST, and API keys, since those aren't bundled (see the table above for exact requirements).
 
 1. **Get the external pieces running.** Simplest path for local testing:
    - An MQTT broker reachable from your machine (e.g. `docker run -p 1883:1883 eclipse-mosquitto`).
@@ -114,13 +129,7 @@ You don't need a Barbara node to try this out — `docker-compose-local.yml` run
    - A Telegram bot token from [@BotFather](https://t.me/BotFather) (only needed if you want to test the Telegram channel — `web-adapter` needs nothing external).
    - An Anthropic API key from the [Anthropic Console](https://console.anthropic.com/).
 
-2. **Fill in the `.env` files.** Each service ships a `.env.example` — copy it to `.env` in the same folder and fill in the real values:
-   ```bash
-   for svc in telegram-adapter web-adapter orchestrator doc-ingestion-worker notifier-scheduler; do
-     cp "$svc/.env.example" "$svc/.env"
-   done
-   # then edit each .env with real credentials
-   ```
+2. **Fill in `barbarasecrets.env`** (repo root) with your real credentials — it ships with placeholders for every service's secrets in one file (see each service's README for which variables it actually reads). Never commit it with real values filled in.
 
 3. **Build and run:**
    ```bash
@@ -131,15 +140,17 @@ You don't need a Barbara node to try this out — `docker-compose-local.yml` run
    - Web chat: open `http://localhost:8090` in a browser.
    - Telegram: message your bot directly (it uses long polling, so no public URL or tunnel needed).
 
-5. **Tweak config without rebuilding**: each service's `appconfig.json` (mounted read-only) is watched and reloaded live — change `debugLevel`, timeouts, or any other setting and it picks it up within ~10s, no restart. Credentials in `.env` are the one thing that *does* need a restart to take effect (normal env var behavior).
+5. **Tweak config without rebuilding**: `appconfigDev/appconfig.json` (mounted read-only at `/appconfig/appconfig.json`) is watched and reloaded live — change any service's `debugLevel`, timeouts, or other settings and it picks it up within ~10s, no restart. `barbarasecrets.env` is the one thing that *does* need a restart to take effect (normal env var behavior).
 
-If you're developing without Docker at all: it's a standard `uv` workspace, so `uv sync` at the repo root sets up every package, and `uv run python -m <package>.main` runs any one service directly (point its secrets at your MQTT/PostgREST/whatever via real env vars).
+If you're developing without Docker at all: it's a standard `uv` workspace, so `uv sync` at the repo root sets up every package, and `uv run python -m <package>.main` runs any one service directly (point `ANTHROPIC_API_KEY`/`MQTT_*`/whatever it needs at real values via env vars, and `/appconfig/appconfig.json` at a local copy of `appconfigDev/appconfig.json` if you want non-default settings).
 
 ## Design notes
 
 A few decisions worth knowing about before you start reading code:
 
-- **MQTT is the only integration point.** No service ever calls another service's HTTP API directly (except `orchestrator`/`doc-ingestion-worker` → PostgREST, which is a data store, not a peer service). Every cross-service interaction is a publish/subscribe over the bus, using the normalized message contract in [`shared/shared/message.py`](./shared/shared/message.py).
+- **`orchestrator` owns every external/shared connection, with two named exceptions.** MQTT, PostgREST, and the Claude API (for the conversational flows) are only ever touched by `orchestrator`. The channel adapters (`telegram-adapter`, `web-adapter`) are the exception on the inbound/outbound side — each manages its own channel connection *and* its own MQTT connection, since they need to publish/subscribe on the bus directly as "external" services in their own right. `doc-ingestion-worker` and `notifier-scheduler` have no MQTT or PostgREST connection at all — they talk to `orchestrator` over a small internal HTTP API (`shared/shared/internal_client.py`'s `InternalApiClient`, a thin `httpx` wrapper with bounded retry — deliberately *not* retry-forever like the MQTT reconnect loop, since these are one-off calls tied to something happening right now, not a long-lived connection worth resurrecting indefinitely).
+- **`doc-ingestion-worker` keeps its own Claude client — the one deliberate exception to full centralization.** Routing its vision-extraction call through `orchestrator` would mean `orchestrator` calls `doc-ingestion-worker` to extract → `doc-ingestion-worker` would have to call back into `orchestrator` just to reach Claude → `orchestrator` would need to relay the result back to `doc-ingestion-worker` again. That's a circular hop for no benefit, so `doc-ingestion-worker` keeps a narrow, direct `AsyncAnthropic` client of its own, purely for vision extraction — everything else about its connectivity (no MQTT, no PostgREST) still follows the centralization rule.
+- **All Claude calls are async (`AsyncAnthropic`), not just fire-and-forget-friendly.** This matters more now than it used to: centralizing every conversational Claude call into one process (`orchestrator`) means a blocking synchronous call would stall every conversation in the house, not just one process's worth of work.
 - **No hand-rolled intent detection.** Every "what does the user want / did they confirm / which quiz option did they mean" decision goes through Claude with forced structured output (tool-use + Pydantic validation + retry-on-invalid-schema) — see [`shared/shared/claude.py`](./shared/shared/claude.py). No keyword matching anywhere in this codebase.
 - **No custom CRUD service.** Device/user/conversation data is served straight off Postgres by PostgREST — see [`db/schema.sql`](./db/schema.sql) for the schema and the `compatible_devices()` SQL function that powers the compatibility graph.
 - **Nothing crashes on a connection hiccup.** Every service retries MQTT connections and missing credentials in a loop (with a configurable backoff) instead of exiting — see `shared/shared/mqtt_client.py` and `shared/shared/settings.py`.

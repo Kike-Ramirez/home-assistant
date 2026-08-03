@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import aiomqtt
-
 from shared.message import NormalizedMessage
+from shared.mqtt_client import ManagedMqttConnection
 from shared.postgrest_client import PostgrestClient
 
 from ..claude_client import ask_replacement
@@ -21,10 +20,10 @@ from ..registry import list_devices_with_standards
 
 async def handle_replacement(
     pg: PostgrestClient,
-    mqtt: aiomqtt.Client,
+    mqtt: ManagedMqttConnection,
     conversation: dict[str, Any],
     msg: NormalizedMessage,
 ) -> None:
     devices = await list_devices_with_standards(pg)
-    answer = ask_replacement(devices, msg.content or "")
+    answer = await ask_replacement(devices, msg.content or "")
     await reply(mqtt, msg, answer)

@@ -1,7 +1,17 @@
-"""orchestrator: stateless MQTT consumer — decides the intent and runs the right flow.
+"""orchestrator: the single point of contact for MQTT, PostgREST, and Claude.
 
 Conversation state always lives in Postgres (via PostgREST), never in process
 memory (CLAUDE.md section 4) — that's what lets this scale to replicas.
+
+Runs two independent things side by side: the MQTT connection (consuming
+`home/inbound/+/+`, same as before) and a small internal HTTP API — reachable
+only on the `barbaraServices` Docker network, no host port published, no auth
+(same trusted-LAN reasoning as PostgREST without JWT and web-adapter without
+a login) — that doc-ingestion-worker and notifier-scheduler call instead of
+talking to MQTT/PostgREST themselves. See CLAUDE.md and the root README for
+why: this used to be 5 services each holding their own MQTT/PostgREST/Claude
+credentials; now only orchestrator (plus the two channel adapters, which keep
+their own MQTT connection by design) does.
 """
 
 from __future__ import annotations
@@ -9,8 +19,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from shared.message import DOC_INGESTION_RESULT_TOPIC, DocIngestionResult, NormalizedMessage
-from shared.mqtt_client import maintain_mqtt_connection
+from aiohttp import web
+from shared.message import DocIngestionResult, NormalizedMessage
+from shared.mqtt_client import ManagedMqttConnection, maintain_mqtt_connection
 from shared.postgrest_client import PostgrestClient
 from shared.settings import watch_appconfig
 
@@ -22,11 +33,14 @@ from .flows.onboarding import confirm_onboarding, handle_extraction_result, star
 from .flows.replacement import handle_replacement
 from .flows.troubleshooting import handle_question
 from .messaging import reply
+from .reminders import check_reminders
 
 logger = logging.getLogger("orchestrator")
 
+_mqtt = ManagedMqttConnection("orchestrator")
 
-async def handle_inbound(pg: PostgrestClient, mqtt, payload: bytes) -> None:
+
+async def handle_inbound(pg: PostgrestClient, mqtt: ManagedMqttConnection, payload: bytes) -> None:
     msg = NormalizedMessage.model_validate_json(payload)
     conversation = await get_or_create_conversation(pg, msg.channel, msg.conversation_id)
     pending_action = conversation["state"].get("pending_action")
@@ -52,7 +66,7 @@ async def handle_inbound(pg: PostgrestClient, mqtt, payload: bytes) -> None:
 
     # No open flow: delegate to Claude what the user wants (never our own
     # keyword-matching — CLAUDE.md section 10).
-    classification = classify_intent(msg.content or "")
+    classification = await classify_intent(msg.content or "")
 
     if classification.intent == "course":
         await start_course(pg, mqtt, conversation, msg, classification.topic or (msg.content or ""))
@@ -62,37 +76,60 @@ async def handle_inbound(pg: PostgrestClient, mqtt, payload: bytes) -> None:
         await handle_question(pg, mqtt, conversation, msg)
 
 
-async def handle_doc_result(pg: PostgrestClient, mqtt, payload: bytes) -> None:
-    result = DocIngestionResult.model_validate_json(payload)
-    await handle_extraction_result(pg, mqtt, result)
+# --- Internal HTTP API (doc-ingestion-worker, notifier-scheduler) ----------
 
 
-async def main() -> None:
-    logger.info("orchestrator starting up (PostgREST: %s, Claude model: %s)", postgrest_secrets.url, appconfig.get("claudeModel", "claude-sonnet-5"))
+async def handle_doc_ingestion_result(request: web.Request) -> web.Response:
+    pg: PostgrestClient = request.app["pg"]
+    body = await request.json()
+    result = DocIngestionResult.model_validate(body)
+    await handle_extraction_result(pg, _mqtt, result)
+    return web.json_response({"ok": True})
+
+
+async def handle_reminders_check(request: web.Request) -> web.Response:
+    pg: PostgrestClient = request.app["pg"]
+    processed = await check_reminders(pg, _mqtt)
+    return web.json_response({"processed": processed})
+
+
+def build_app(pg: PostgrestClient) -> web.Application:
+    app = web.Application()
+    app["pg"] = pg
+    app.router.add_post("/internal/doc-ingestion/result", handle_doc_ingestion_result)
+    app.router.add_post("/internal/reminders/check", handle_reminders_check)
+    return app
+
+
+async def _run() -> None:
+    logger.info(
+        "orchestrator starting up (PostgREST: %s, Claude model: %s)",
+        postgrest_secrets.url,
+        appconfig.get("claudeModel", "claude-sonnet-5"),
+    )
     pg = PostgrestClient(postgrest_secrets.url)
 
-    async def on_connect(client) -> None:
-        await client.subscribe("home/inbound/+/+")
-        await client.subscribe(DOC_INGESTION_RESULT_TOPIC)
-        async for message in client.messages:
-            try:
-                if str(message.topic) == DOC_INGESTION_RESULT_TOPIC:
-                    await handle_doc_result(pg, client, message.payload)
-                else:
-                    await handle_inbound(pg, client, message.payload)
-            except Exception:
-                logger.exception("Error processing message from %s", message.topic)
+    async def on_mqtt_connect(client) -> None:
+        await _mqtt.consume(client, "home/inbound/+/+", lambda message: handle_inbound(pg, _mqtt, message.payload))
 
-    # appconfig hot-reloads in the background — the service's own parameters
-    # (claudeModel, maxTokens, webSearchEnabled) are already read fresh on
-    # every Claude call, so no extra hook is needed here.
+    mqtt_task = asyncio.create_task(maintain_mqtt_connection(mqtt_secrets, system, on_mqtt_connect))
     config_task = asyncio.create_task(watch_appconfig(SERVICE_NAME, system, appconfig))
+
+    app = build_app(pg)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=appconfig.get("port", 8080))
+    await site.start()
+    logger.info("orchestrator internal API listening on :%s", appconfig.get("port", 8080))
+
     try:
-        await maintain_mqtt_connection(mqtt_secrets, system, on_connect)
+        await asyncio.Event().wait()  # keeps the process alive
     finally:
+        mqtt_task.cancel()
         config_task.cancel()
+        await runner.cleanup()
         await pg.aclose()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(_run())

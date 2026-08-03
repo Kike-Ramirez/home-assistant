@@ -12,9 +12,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import aiomqtt
-
 from shared.message import NormalizedMessage
+from shared.mqtt_client import ManagedMqttConnection
 from shared.postgrest_client import PostgrestClient
 
 from ..claude_client import generate_course, interpret_quiz_answer
@@ -32,12 +31,12 @@ def _format_question(question: dict[str, Any], index: int, total: int) -> str:
 
 async def start_course(
     pg: PostgrestClient,
-    mqtt: aiomqtt.Client,
+    mqtt: ManagedMqttConnection,
     conversation: dict[str, Any],
     msg: NormalizedMessage,
     topic: str,
 ) -> None:
-    course = generate_course(topic)
+    course = await generate_course(topic)
     # From here on we work with plain dicts (JSON-serializable) — that's what
     # they'll turn into anyway after the first roundtrip through PostgREST.
     questions = [q.model_dump() for q in course.questions]
@@ -58,7 +57,7 @@ async def start_course(
 
 async def handle_quiz_answer(
     pg: PostgrestClient,
-    mqtt: aiomqtt.Client,
+    mqtt: ManagedMqttConnection,
     conversation: dict[str, Any],
     msg: NormalizedMessage,
 ) -> None:
@@ -67,7 +66,7 @@ async def handle_quiz_answer(
     index: int = state["quiz_index"]
     question = questions[index]
 
-    selected = interpret_quiz_answer(question["question"], question["options"], msg.content or "")
+    selected = await interpret_quiz_answer(question["question"], question["options"], msg.content or "")
     if selected is None:
         await reply(mqtt, msg, "No he entendido tu respuesta — indica la opción (ej. 'la B' o el texto de la opción).")
         return

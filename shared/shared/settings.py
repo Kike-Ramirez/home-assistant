@@ -1,8 +1,15 @@
-"""Secrets/appconfig split (pattern used by Barbara apps — CLAUDE.md section 10).
+"""Secrets/appconfig split, matching Barbara's own boilerplate exactly (see
+https://github.com/Barbaraedge/training_barbara_apps_development/tree/main/boilerplate_01_python
+and CLAUDE.md section 10) so this project is drop-in compatible with how the
+platform injects configuration on a real node:
 
-- Secrets: env vars, never versioned (credentials, hosts, tokens).
-- AppConfig: versioned JSON mounted at /app/appconfig.json, in the standard
-  shape used by Barbara connectors:
+- Secrets: env vars, injected the same way into every container of this app
+  — ONE store per project (`barbarasecrets.env` at the repo root in dev, the
+  platform's own Secrets on a Barbara node), not one per service. Never
+  versioned with real values.
+- AppConfig: ONE versioned JSON for the whole app (application-level;
+  `appconfig.json`), mounted at /appconfig/appconfig.json, in the standard
+  shape used by Barbara connectors — one top-level key per service:
 
     {
       "<service>": {
@@ -16,6 +23,11 @@
   connection (MQTT, PostgREST) drops or fails. Any other service-specific
   parameter is a sibling key of `system` (same pattern as `inputs` in
   Barbara's Industrial Data Simulator), not nested under a generic wrapper.
+- Also present (device-level; `global.json`), mounted at
+  /appconfig/global.json — Barbara's "Appconfig Device Level". Not consumed
+  by any service yet (nothing in this project needs device-wide config
+  today), but `load_global_config()` is included so the file has somewhere
+  to be read from the moment something does.
 
 Logging policy for incomplete configuration (per explicit request):
 - Missing appconfig parameter at runtime -> WARNING + default value (if any)
@@ -26,9 +38,9 @@ Logging policy for incomplete configuration (per explicit request):
   shows up, same as network reconnects — see `load_secrets`.
 
 Hot reload vs. restart (per explicit request):
-- Secrets (env vars): only read once at process startup — a change in `.env`
-  ALWAYS requires restarting the service (normal env var behavior, nothing to
-  do here).
+- Secrets (env vars): only read once at process startup — a change in
+  `barbarasecrets.env` ALWAYS requires restarting the service (normal env var
+  behavior, nothing to do here).
 - AppConfig (`appconfig.json`): reloaded periodically in the background
   (`watch_appconfig`); any detected change gets logged (old value -> new) and
   applied without restarting the process.
@@ -83,6 +95,25 @@ class AnthropicSecrets(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ANTHROPIC_", extra="ignore")
 
     api_key: str
+
+
+class OrchestratorSecrets(BaseSettings):
+    """Where to reach orchestrator's internal API — used by doc-ingestion-worker
+    (to deliver extraction results) and notifier-scheduler (to trigger a
+    reminder check). Not sensitive, but kept alongside the other connection
+    secrets for consistency (same pattern as POSTGREST_URL)."""
+
+    model_config = SettingsConfigDict(env_prefix="ORCHESTRATOR_", extra="ignore")
+
+    url: str
+
+
+class DocIngestionWorkerSecrets(BaseSettings):
+    """Where orchestrator reaches doc-ingestion-worker to fire an extraction job."""
+
+    model_config = SettingsConfigDict(env_prefix="DOC_INGESTION_WORKER_", extra="ignore")
+
+    url: str
 
 
 class SystemConfig(BaseModel):
@@ -145,14 +176,27 @@ class ConfigAccessor:
         return changed
 
 
-def load_appconfig(path: str = "/app/appconfig.json") -> dict[str, Any]:
+def load_appconfig(path: str = "/appconfig/appconfig.json") -> dict[str, Any]:
     config_path = Path(path)
     if not config_path.exists():
         return {}
     return json.loads(config_path.read_text())
 
 
-def load_service_config(service_key: str, path: str = "/app/appconfig.json") -> tuple[SystemConfig, ConfigAccessor]:
+def load_global_config(path: str = "/appconfig/global.json") -> dict[str, Any]:
+    """Reads Barbara's device-level config (`global.json`) — not scoped to any
+    single service, unlike `appconfig.json`. Not consumed by any service in
+    this project yet; included so it's a one-line call away once something
+    needs device-wide config, instead of a schema change."""
+    config_path = Path(path)
+    if not config_path.exists():
+        return {}
+    return json.loads(config_path.read_text())
+
+
+def load_service_config(
+    service_key: str, path: str = "/appconfig/appconfig.json"
+) -> tuple[SystemConfig, ConfigAccessor]:
     """Returns (system, appconfig) for `service_key` out of the full appconfig.
 
     `appconfig` is a `ConfigAccessor` over everything under `service_key`
@@ -197,31 +241,33 @@ def load_secrets(model: type[SecretsT], service_name: str, retry_seconds: float 
 
 
 def bootstrap_service(
-    service_name: str, path: str = "/app/appconfig.json"
-) -> tuple[SystemConfig, ConfigAccessor, MqttSecrets]:
-    """Standard service startup: appconfig -> logging -> MQTT secrets.
+    service_name: str, path: str = "/appconfig/appconfig.json"
+) -> tuple[SystemConfig, ConfigAccessor]:
+    """Standard service startup: appconfig -> logging.
 
     Centralizes in one place a sequence whose order matters (and which used
     to be repeated, identically, in every service's `config.py`): appconfig
     is loaded first because it never fails (it has defaults for everything),
     so logging gets configured with the right level BEFORE trying to
-    validate secrets — if one's missing, the error already comes out nicely
-    formatted instead of with Python's default logging setup. Every service
-    here uses MQTT, so its secrets get loaded here too; any other secret
-    (Anthropic, Telegram, PostgREST...) still gets loaded separately with
-    `load_secrets` in each service's own `config.py`.
+    validate any secrets — if one's missing, the error already comes out
+    nicely formatted instead of with Python's default logging setup.
+
+    Doesn't load MQTT secrets anymore (not every service has an MQTT
+    connection since the "orchestrator owns every external connection"
+    redesign — see CLAUDE.md). Each service loads whatever secrets it
+    actually needs — MQTT included, where relevant — with `load_secrets`
+    right after calling this.
     """
     system, appconfig = load_service_config(service_name, path)
     logging.basicConfig(level=system.log_level)
-    mqtt_secrets = load_secrets(MqttSecrets, service_name, system.connect_timeout_seconds)
-    return system, appconfig, mqtt_secrets
+    return system, appconfig
 
 
 async def watch_appconfig(
     service_key: str,
     system: SystemConfig,
     appconfig: ConfigAccessor,
-    path: str = "/app/appconfig.json",
+    path: str = "/appconfig/appconfig.json",
     interval_seconds: float = APPCONFIG_RELOAD_SECONDS,
     on_change: Callable[[set[str]], Awaitable[None]] | None = None,
 ) -> None:

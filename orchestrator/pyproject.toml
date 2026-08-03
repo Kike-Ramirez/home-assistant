@@ -8,6 +8,8 @@ dependencies = [
     "aiomqtt>=2.1",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
+    "aiohttp>=3.9",       # internal API for doc-ingestion-worker/notifier-scheduler
+    "python-dateutil>=2.9",  # RRULE parsing for reminders.py (moved here from notifier-scheduler)
 ]
 
 [tool.uv.sources]

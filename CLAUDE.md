@@ -103,10 +103,10 @@ home/events/firmware_update
 
 ## 6. The 4 conversation flows (functional detail)
 
-1. **Device onboarding**: user sends a photo of a label/manual → `doc-ingestion-worker` calls Claude (vision) to extract structured data (brand, model, specs, category) → shown to the user to confirm/correct → saved via `device-registry-api`.
+1. **Device onboarding**: user sends a photo of a label/manual → `doc-ingestion-worker` calls Claude (vision) to extract structured data (brand, model, specs, category) → shown to the user to confirm/correct → saved via **PostgREST** (see the note right above — no custom registry API).
 2. **Troubleshooting**: `orchestrator` fetches the relevant device's spec sheet from Postgres, decides whether it needs `web_search` (via a Claude tool) for more info (online manuals, forums, known fixes) → returns a step-by-step guide.
 3. **Quick course + quiz**: `orchestrator` generates educational content on the requested topic plus a quiz; saves the correct answers in the conversation session (Postgres); grades it at the end and gives feedback.
-4. **Replacement / new purchase**: `orchestrator` queries the compatibility graph in `device-registry-api` + uses `web_search` for popularity/pricing → returns ranked options with cited sources.
+4. **Replacement / new purchase**: `orchestrator` queries the compatibility graph via PostgREST (`home.compatible_devices`) + uses `web_search` for popularity/pricing → returns ranked options with cited sources.
 
 ---
 
@@ -146,7 +146,39 @@ This project could evolve into a Barbara use case for an industrial area's knowl
 
 > Update this section at the end of every relevant Claude Code session. Keep it as a **snapshot of the current state** (what's there and how it works), not a chronological session log — the history of "why we got here" lives in the conversation/commit history, not here.
 
-**Phase:** Functional end-to-end MVP (4 flows + notifier-scheduler), not yet tested against real infrastructure (broker/Postgres/PostgREST/Claude) — only compiled, linted, and tested with mocks.
+**Phase:** Functional end-to-end MVP (4 flows + notifier-scheduler) **plus** a completed internal-communications redesign (see below), not yet tested against real infrastructure (broker/Postgres/PostgREST/Claude) — only compiled, linted, and tested with mocks (respx for HTTP, aiohttp TestClient/TestServer, AsyncMock/MagicMock for PostgREST/MQTT).
+
+### Internal/external communications redesign (latest session)
+
+`orchestrator` is now the **single owner of every external/shared connection** — MQTT, PostgREST, and the Claude API for all conversational flows — with two categories of named exception:
+
+- **Channel adapters** (`telegram-adapter`, `web-adapter`) keep their own MQTT connection *and* their own channel connection (Telegram/WebSocket) — they're "external" services in their own right, publishing/subscribing on `home/inbound/<channel>/*` and `home/outbound/<channel>/*` directly. Unchanged by this redesign.
+- **`doc-ingestion-worker`** keeps its own `AsyncAnthropic` client, purely for vision extraction — the one deliberate exception to full centralization, to avoid a circular HTTP hop (`orchestrator` → this service → back to `orchestrator` for Claude → back to this service). It otherwise has **no MQTT, no PostgREST** — reached via `orchestrator`'s internal HTTP API instead.
+
+Everything else that isn't a channel adapter now talks to `orchestrator` over a small internal HTTP API (`shared.internal_client.InternalApiClient` — thin `httpx` wrapper, bounded retry, returns `None` on total failure instead of raising):
+
+| Endpoint (on `orchestrator`, port `8080`, not host-exposed) | Called by | Replaces |
+|---|---|---|
+| `POST /extract` (on `doc-ingestion-worker`, port `8080`) | `orchestrator` | the old `home/events/doc_ingestion` MQTT topic |
+| `POST /internal/doc-ingestion/result` | `doc-ingestion-worker` | the old `home/events/doc_ingestion_result` MQTT topic |
+| `POST /internal/reminders/check` | `notifier-scheduler` | `notifier-scheduler`'s old direct PostgREST/MQTT reminder logic |
+
+Other changes that came with this redesign:
+- **All Claude calls are now async** (`AsyncAnthropic` instead of `Anthropic`, `call_structured()` is now `async def`) — centralizing every conversational call into one process means a blocking synchronous call would stall every conversation in the house, not just one process's worth of work.
+- **`bootstrap_service()` no longer auto-loads MQTT secrets** — not every service has an MQTT connection anymore. It now returns `(system, appconfig)`; each service's `config.py` explicitly calls `load_secrets()` for whatever it actually needs (`MqttSecrets` only for `orchestrator`/`telegram-adapter`/`web-adapter`; new `OrchestratorSecrets`/`DocIngestionWorkerSecrets` for the internal-API URLs).
+- **`notifier-scheduler` lost its reminder logic entirely** — it's now a bare cron heartbeat that pings `/internal/reminders/check`. The logic (fetch due reminders, dispatch, word via Claude, reschedule/mark-sent) moved to `orchestrator/orchestrator/reminders.py`. It still exists as a separate service solely because it owns a Postgres-backed `APScheduler` jobstore that needs to survive independently of `orchestrator`'s process lifecycle.
+- **Closed a previously-dead gap as a side effect**: the "reminder needs Claude to word it nicely" path (previously an MQTT event nobody consumed — see old known-gap #2 below) is now a real code path, `word_reminder()` in `orchestrator/orchestrator/claude_client.py`, called from `dispatch_reminder()`.
+
+### Configuration made 100% Barbara-compatible (latest session)
+
+Switched from one `appconfig.json`/`.env.example` **per service** to the exact single-file convention used by Barbara's own [`boilerplate_01_python`](https://github.com/Barbaraedge/training_barbara_apps_development/tree/main/boilerplate_01_python) reference project — one appconfig, one secrets file, for the **whole app**, not one per docker-compose service (this is genuinely how Barbara Secrets/Appconfig work on a real node: one store per app/project, injected identically into every container):
+
+- **`appconfigDev/appconfig.json`** (repo root) replaces the 5 per-service `appconfig.json` files — one JSON, one top-level key per service, merged from what used to be scattered across the repo. Mounted read-only at `/appconfig/appconfig.json` in every container (was `/app/appconfig.json`, one per service).
+- **`appconfigDev/global.json`** (repo root) is new — Barbara's "Appconfig Device Level", mounted at `/appconfig/global.json`. Not consumed by any service yet; `shared/shared/settings.py` now has `load_global_config()` ready for whenever something needs it.
+- **`barbarasecrets.env`** (repo root) replaces the 5 per-service `.env.example` files — one env file with every service's secrets (MQTT/Anthropic/PostgREST/etc.), deduplicated (e.g. one set of `MQTT_*` vars, not five copies), injected identically into every container via `env_file:` in `docker-compose-local.yml`.
+- **`shared/shared/settings.py`**: `load_appconfig`, `load_service_config`, `bootstrap_service`, and `watch_appconfig` all default to `/appconfig/appconfig.json` now (was `/app/appconfig.json`); no service's `config.py` needed changes, since none of them overrode the default path.
+- **`docker-compose-local.yml`**: every service's `env_file`/`volumes` now point at the shared root files (`barbarasecrets.env`, `./appconfigDev:/appconfig:ro`) instead of its own folder. `docker-compose.yml` (the Barbara-node file) needed no changes — it never declared per-service `volumes`/`env_file` to begin with, since the platform already injects both at these same paths.
+- The 5 per-service `appconfig.json` and `.env.example` files are deleted — no longer used anywhere.
 
 ### Repo structure
 
@@ -154,14 +186,14 @@ Monorepo with `uv` workspaces. One package per service + `shared/`:
 
 | Package | Role |
 |---|---|
-| `shared` | MQTT message contract (`message.py`), PostgREST client over `postgrest-py` (`postgrest_client.py`), MQTT client/reconnection over `aiomqtt` (`mqtt_client.py`), secrets/appconfig/logging/hot-reload (`settings.py`), structured Claude call helper (`claude.py`) |
-| `telegram-adapter` | Telegram channel — `aiogram` v3, long polling (no port, no webhook) |
-| `web-adapter` | "Always available" web chat channel (no Telegram dependency) — `aiohttp` + WebSocket, self-contained static page at `/`, the only service with an exposed port (8090) |
-| `orchestrator` | The conversational brain: routes by channel/intent, runs the 4 flows, stateless (state in `home.conversation` via PostgREST) |
-| `doc-ingestion-worker` | Extracts data from label photos via Claude vision, with bounded concurrency |
-| `notifier-scheduler` | `APScheduler` + Postgres jobstore; checks `home.reminder` and publishes alerts |
+| `shared` | MQTT message contract (`message.py`), PostgREST client over `postgrest-py` (`postgrest_client.py`), MQTT client/reconnection over `aiomqtt` (`mqtt_client.py`), internal HTTP client over `httpx` (`internal_client.py`), secrets/appconfig/logging/hot-reload (`settings.py`), structured Claude call helper using `AsyncAnthropic` (`claude.py`) |
+| `telegram-adapter` | Telegram channel — `aiogram` v3, long polling (no port, no webhook); owns its own MQTT connection |
+| `web-adapter` | "Always available" web chat channel (no Telegram dependency) — `aiohttp` + WebSocket, self-contained static page at `/`, the only service with a host-exposed port (8090); owns its own MQTT connection |
+| `orchestrator` | The conversational brain: routes by channel/intent, runs the 4 flows, stateless (state in `home.conversation` via PostgREST). The only service connected to MQTT/PostgREST/Claude besides the two adapters; also runs the internal HTTP API (port 8080, not host-exposed) described above |
+| `doc-ingestion-worker` | Extracts data from label photos via Claude vision, with bounded concurrency. No MQTT/PostgREST — reached via `POST /extract`, calls back via `POST /internal/doc-ingestion/result`. Keeps its own `AsyncAnthropic` client (the one exception) |
+| `notifier-scheduler` | `APScheduler` + Postgres jobstore, nothing else — pings `orchestrator`'s `POST /internal/reminders/check` on a timer |
 
-`docker-compose.yml` (Barbara node: no `volumes`/`env_file`, the platform injects them) and `docker-compose-local.yml` (local debugging: keeps them) share a single `Dockerfile.service` parameterized via build args (`SERVICE`, `MODULE`) — there's no per-service Dockerfile. Both use the `barbaraServices` network (`driver: bridge`).
+`docker-compose.yml` (Barbara node: no `volumes`/`env_file`, the platform injects them) and `docker-compose-local.yml` (local debugging: every service mounts the shared `appconfigDev/` and `barbarasecrets.env` at the repo root — see the configuration subsection above) share a single `Dockerfile.service` parameterized via build args (`SERVICE`, `MODULE`) — there's no per-service Dockerfile. Both use the `barbaraServices` network (`driver: bridge`); `orchestrator`'s and `doc-ingestion-worker`'s internal ports need no `ports:` mapping since they're reachable over the network's internal Docker DNS (only `web-adapter` needs a host-exposed port). Root `README.md` + a `README.md` per package, plus a root `LICENSE` (MIT) — see the next subsection.
 
 ### The 4 flows (in `orchestrator`)
 
@@ -174,11 +206,11 @@ With no pending conversation state, `classify_intent` (Claude) decides which flo
 
 ### Configuration, logging, and resilience (`shared/settings.py`, `shared/mqtt_client.py`)
 
-- **Secrets** (env vars) vs. **appconfig** (`appconfig.json`, matching Barbara's real shape: `{"<service>": {"system": {"debugLevel", "connectTimeoutMs"}, "otherParam": ...}}`).
+- **Secrets** (`barbarasecrets.env`, one file for the whole app) vs. **appconfig** (`appconfigDev/appconfig.json`, one file for the whole app, matching Barbara's real shape: `{"<service>": {"system": {"debugLevel", "connectTimeoutMs"}, "otherParam": ...}}`) vs. **global config** (`appconfigDev/global.json`, device-level, not consumed yet) — see the configuration subsection above for why these are single, repo-wide files rather than one per service.
 - **No service ever stops over a connection/configuration problem**, whether at startup or while running: `load_secrets` retries in a loop (never `sys.exit`) if a credential is missing, naming the exact variable; `maintain_mqtt_connection` reconnects forever with a backoff of `connectTimeoutMs`. In the channel adapters, MQTT lives in a background task independent of the channel itself (Telegram/HTTP keep working even while MQTT is down).
-- **`appconfig.json` hot-reloads** every 10s (`watch_appconfig`), no restart needed — secrets always require a restart. One real exception: `web-adapter`'s `port` can't be re-bound without a restart.
-- **`bootstrap_service(name)`** centralizes each `config.py`'s startup (appconfig → logging → MQTT secrets) into a single call.
-- Known, accepted edge cases: in `doc-ingestion-worker`, a photo already being processed when MQTT drops loses its result (not retried); in `web-adapter`, outbound messages are dropped if the browser tab is closed (it's the fallback/debugging channel, not the primary one).
+- **`appconfig.json` hot-reloads** every 10s (`watch_appconfig`), reading `/appconfig/appconfig.json` — no restart needed — secrets always require a restart. Real exceptions: `web-adapter`'s `port`, and `orchestrator`'s and `doc-ingestion-worker`'s internal-API `port` — none of them can be re-bound without a restart.
+- **`bootstrap_service(name)`** centralizes each `config.py`'s startup (appconfig → logging) into a single call, defaulting to `/appconfig/appconfig.json` — it no longer auto-loads MQTT secrets (see redesign notes above); each service loads exactly the secrets it needs afterward.
+- Known, accepted edge cases: in `doc-ingestion-worker`, a request already being processed when the container dies loses its result (not retried, no persistent queue); in `web-adapter`, outbound messages are dropped if the browser tab is closed (it's the fallback/debugging channel, not the primary one); `InternalApiClient`'s bounded retry means a transient blip while `orchestrator` is restarting can drop one `doc-ingestion` callback or one `reminders/check` tick — acceptable for a home project, the next scheduled tick or user action recovers.
 
 ### Data schema (`db/schema.sql`)
 
@@ -186,14 +218,21 @@ Schema `home`, a single `app_service` role (no JWT — see the comment in the fi
 
 > Note: `home.message`, `home.device_compatibility`, `device_type.attributes_schema`/`parent_type_id`, and `device.owner_user_id` are defined but no flow uses them yet — that's deliberate design from the original brief (section 7/8, leaving cheap room now), not dead code; it's an open decision whether to trim them at some point.
 
+### Documentation, licensing, and language
+
+- **Public-facing docs**: a root `README.md` (functionality, architecture diagram, service table, external dependencies, local run instructions) plus one `README.md` per service/package (config, secrets, how to get external credentials — Telegram bot token, Anthropic API key). `LICENSE` is MIT, chosen specifically so the repo can be shown publicly.
+- **Repo language policy**: all code (comments, docstrings, log messages), the DDL, `CLAUDE.md`, and every README are in English. Reasoning/system prompts sent to Claude are English too.
+- **Explicit exception**: the fixed reply strings the assistant actually sends back to the user (in `flows/onboarding.py`, `flows/course.py`) and the `web-adapter` static UI (`static/index.html`) are intentionally left in Spanish — that's the household's real spoken language, and replies are meant to mirror whatever language the user writes in, not be forced into English. For Claude-generated replies (troubleshooting, replacement, course content), every relevant system prompt in `claude_client.py` explicitly instructs Claude to reply in the same language the user wrote in, so that part already works correctly regardless of what language the prompt itself is written in.
+
 ### Known gaps (not blocking, pending a future flow)
 
 1. Nothing creates rows in `home.reminder` yet — there's no flow/command for the user to schedule a reminder.
-2. `orchestrator` doesn't subscribe to `home/events/{reminder,price_alert,firmware_update}` yet — the "reminder needs Claude to word it" path publishes the event, but nothing consumes it today.
-3. Nothing creates rows in `home.app_user` — channel/user resolution in `notifier-scheduler` won't find anything until that flow exists.
+2. ~~`orchestrator` doesn't subscribe to the reminder-wording event~~ — **closed** by this session's redesign: `dispatch_reminder()` in `orchestrator/orchestrator/reminders.py` now calls `word_reminder()` (Claude) directly whenever a due reminder has no ready-made `payload.message`, no MQTT event involved anymore.
+3. Nothing creates rows in `home.app_user` — channel/user resolution for a reminder (now inside `orchestrator/orchestrator/reminders.py`) won't find anything until that flow exists.
 4. Verify before going to production: the exact name/version of the `web_search_20250305` tool in `shared/claude.py`, against the current `anthropic` SDK docs.
 5. The parameterized `Dockerfile.service` hasn't been tested with a real Docker build in this session (no Docker available in this environment) — validated only by careful reading of the syntax and the compose variables.
+6. The ~10 fixed deterministic reply strings (onboarding acks, quiz progress messages) have no per-message language detection wired up — they stay in Spanish regardless of what language the user actually wrote in, unlike the Claude-generated replies. Only worth fixing if the household ever needs the assistant to work in more than one language day-to-day.
 
-**Pending (functional, suggested order):** the reminder-creation flow (closes gaps 1-3) → verification against real infrastructure (broker/Postgres/PostgREST/Claude on an actual node).
+**Pending (functional, suggested order):** the reminder-creation flow (closes gaps 1 and 3) → verification against real infrastructure (broker/Postgres/PostgREST/Claude on an actual node, including the new internal HTTP API between `orchestrator`/`doc-ingestion-worker`/`notifier-scheduler`).
 
 **Blockers/open decisions:** none.

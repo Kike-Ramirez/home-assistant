@@ -8,23 +8,27 @@ exact version — more than we need here).
 
 Used by both `orchestrator` (intent classification, confirmation/quiz-answer
 interpretation, course generation) and `doc-ingestion-worker` (extracting
-data from a photo) — each used to have its own mechanism (one solid, built on
-this same pattern; the other a `json.loads` with no schema validation at
-all). Now they share the same one.
+data from a photo).
+
+Async (`AsyncAnthropic`), not the sync client: now that `orchestrator` is the
+single point of contact for the Claude API, a blocking call here would stall
+every other conversation in the house for however long that one call takes —
+that's a much bigger blast radius than when Claude calls were split across
+two separate processes.
 """
 
 from __future__ import annotations
 
 from typing import Any, TypeVar
 
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel, ValidationError
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-def call_structured(
-    client: Anthropic,
+async def call_structured(
+    client: AsyncAnthropic,
     model_name: str,
     system: str,
     user_content: str | list[dict[str, Any]],
@@ -46,7 +50,7 @@ def call_structured(
 
     last_error: Exception | None = None
     for _ in range(max_retries + 1):
-        response = client.messages.create(
+        response = await client.messages.create(
             model=model_name,
             max_tokens=max_tokens,
             system=system,

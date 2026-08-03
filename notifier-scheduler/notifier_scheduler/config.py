@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from shared.settings import PostgrestSecrets, bootstrap_service, load_secrets
+from shared.settings import OrchestratorSecrets, bootstrap_service, load_secrets
 
 SERVICE_NAME = "notifier_scheduler"
 
-system, appconfig, mqtt_secrets = bootstrap_service(SERVICE_NAME)
+system, appconfig = bootstrap_service(SERVICE_NAME)
 
 
 class SchedulerSecrets(BaseSettings):
@@ -13,9 +13,11 @@ class SchedulerSecrets(BaseSettings):
 
     # Own DSN for the APScheduler jobstore (SQLAlchemyJobStore) — this is an
     # internal scheduler detail, not domain data access, so it doesn't go
-    # through PostgREST (see CLAUDE.md section 10).
+    # through orchestrator/PostgREST (see CLAUDE.md section 10). Everything
+    # else this service used to touch directly (PostgREST, MQTT) now goes
+    # through orchestrator's internal API instead.
     postgres_dsn: str
 
 
-postgrest_secrets = load_secrets(PostgrestSecrets, SERVICE_NAME, system.connect_timeout_seconds)
 scheduler_secrets = load_secrets(SchedulerSecrets, SERVICE_NAME, system.connect_timeout_seconds)
+orchestrator_secrets = load_secrets(OrchestratorSecrets, SERVICE_NAME, system.connect_timeout_seconds)

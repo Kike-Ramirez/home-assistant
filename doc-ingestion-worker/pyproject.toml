@@ -6,6 +6,7 @@ dependencies = [
     "shared",
     "anthropic>=0.34",
     "pydantic-settings>=2.3",
+    "aiohttp>=3.9",  # /extract endpoint — no more MQTT, orchestrator calls this directly
 ]
 
 [tool.uv.sources]

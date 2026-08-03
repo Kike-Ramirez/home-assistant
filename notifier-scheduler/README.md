@@ -1,38 +1,34 @@
 # notifier-scheduler
 
-Checks for due reminders (maintenance nudges, price alerts, firmware updates) and pushes them out through the right channel. Cron-like, via [`APScheduler`](https://apscheduler.readthedocs.io/).
+A cron heartbeat, nothing more. Used to check for due reminders (maintenance nudges, price alerts, firmware updates) and push them out through the right channel itself, talking to PostgREST and MQTT directly. Under the "`orchestrator` owns every external/shared connection" design (see the root [README's design notes](../README.md#design-notes)), all of that logic moved to `orchestrator` (`orchestrator/orchestrator/reminders.py`) — this service's only remaining job is to ping `orchestrator` on a timer via [`APScheduler`](https://apscheduler.readthedocs.io/).
+
+It still exists as its own service (rather than just being an `APScheduler` job inside `orchestrator`) because of the one thing it still owns: its own Postgres-backed jobstore, so scheduled ticks survive a container restart independently of `orchestrator`'s own process lifecycle.
 
 ## How it works
 
-- Runs a periodic job (every `checkIntervalSeconds`) that queries `home.reminder` for anything with `status=pending` and `scheduled_at <= now`, via PostgREST.
-- For each due reminder: if it already has a ready-to-send `payload.message` and the target user's channel can be resolved, it's sent straight to `home/outbound/<channel>/<user_id>` — no need to go through `orchestrator`. Otherwise, it publishes the raw event to `home/events/{reminder,price_alert,firmware_update}` (by `kind`) for something downstream to turn into a properly-worded message.
-- Recurring reminders (`recurrence_rule`, a standard iCal RRULE) get rescheduled to their next occurrence via [`dateutil.rrule`](https://dateutil.readthedocs.io/); one-off reminders get marked `sent`.
-- **Unlike every other service here, this one doesn't keep a persistent MQTT connection** — it only ever publishes, never subscribes, so each scheduled tick opens a fresh connection, does its thing, and closes it. Simpler than managing the lifecycle of a connection that would sit idle most of the time. If that connection attempt fails, it retries once after `connectTimeoutMs`, then gives up until the next tick.
-- The `APScheduler` jobstore lives in Postgres (`SQLAlchemyJobStore`) so scheduled jobs survive a container restart — that's what `POSTGRES_DSN` is for below, separate from the PostgREST connection used for actual domain data.
-
-### Known gaps (not this service's fault — nothing upstream feeds it yet)
-
-- Nothing in this codebase creates rows in `home.reminder` yet — there's no "remind me to..." flow wired up on the `orchestrator` side. This service is ready to serve reminders the moment something starts creating them.
-- `orchestrator` doesn't subscribe to `home/events/{reminder,price_alert,firmware_update}` yet, so the "needs Claude to word it nicely" path publishes an event that nothing currently consumes.
-- Nothing creates rows in `home.app_user` yet, so channel/user resolution for a reminder will come up empty until that exists too.
+- Runs a periodic job (every `checkIntervalSeconds`) that calls `POST /internal/reminders/check` on `orchestrator` — no PostgREST, no MQTT, no reminder logic of its own anymore.
+- `orchestrator` does the actual work behind that endpoint: reads `home.reminder` for anything due, sends the ones with a ready-to-send message straight to the user's channel, asks Claude to word the ones that need it (closing what used to be a dead-end gap — nothing consumed that path before), reschedules recurring reminders via `dateutil.rrule`, and marks one-off ones `sent`. It replies `{"processed": <count>}`.
+- If the call to `orchestrator` fails, `shared.internal_client.InternalApiClient` already retries a couple of times and logs the failure — this service doesn't need its own retry logic on top; the next scheduled tick will just try again.
+- The `APScheduler` jobstore lives in Postgres (`SQLAlchemyJobStore`) so scheduled jobs survive a container restart — that's what `POSTGRES_DSN` is for below. This is now the only Postgres connection this service has (no more PostgREST access to domain data).
 
 ## Configuration
 
-### Secrets (`.env`)
+Like every service here, this reads its config from the **shared** files at the repo root — see the [root README](../README.md#configuration-one-shared-appconfig--one-shared-secrets-file) for why. Below are just the parts this service actually reads.
 
-Copy `.env.example` to `.env` and fill in:
+### Secrets (`barbarasecrets.env`)
+
+Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecrets.env):
 
 | Variable | Required | Description |
 |---|---|---|
-| `POSTGREST_URL` | yes | Base URL of the PostgREST instance, e.g. `http://postgrest:3000` |
+| `ORCHESTRATOR_URL` | yes | Base URL of `orchestrator`'s internal API, e.g. `http://orchestrator:8080` |
 | `POSTGRES_DSN` | yes | Direct Postgres connection string for the APScheduler jobstore, e.g. `postgresql://app_service:password@postgresql:5432/home` |
-| `MQTT_HOST` | yes | MQTT broker hostname |
-| `MQTT_PORT` | no (default `8883`) | MQTT broker port |
-| `MQTT_USER` | yes | MQTT username |
-| `MQTT_PASSWORD` | yes | MQTT password |
-| `MQTT_TLS_ENABLED` | no (default `true`) | Whether to use TLS for the MQTT connection |
 
-### AppConfig (`appconfig.json`)
+No `MQTT_*` or `POSTGREST_URL` needed anymore — see above, this service only ever talks to `orchestrator`.
+
+### AppConfig (`appconfigDev/appconfig.json`)
+
+`notifier-scheduler`'s own slice of the repo-root [`appconfigDev/appconfig.json`](../appconfigDev/appconfig.json):
 
 ```json
 {

@@ -8,9 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
-import aiomqtt
-
 from shared.message import NormalizedMessage
+from shared.mqtt_client import ManagedMqttConnection
 from shared.postgrest_client import PostgrestClient
 
 from ..claude_client import ask_troubleshooting
@@ -18,7 +17,7 @@ from ..messaging import reply
 from ..registry import list_devices
 
 
-async def handle_question(pg: PostgrestClient, mqtt: aiomqtt.Client, conversation: dict[str, Any], msg: NormalizedMessage) -> None:
+async def handle_question(pg: PostgrestClient, mqtt: ManagedMqttConnection, conversation: dict[str, Any], msg: NormalizedMessage) -> None:
     devices = await list_devices(pg)
-    answer = ask_troubleshooting(devices, msg.content or "")
+    answer = await ask_troubleshooting(devices, msg.content or "")
     await reply(mqtt, msg, answer)

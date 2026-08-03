@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from shared.settings import bootstrap_service, load_secrets
+from shared.settings import MqttSecrets, bootstrap_service, load_secrets
 
 SERVICE_NAME = "telegram_adapter"
 
-system, appconfig, mqtt_secrets = bootstrap_service(SERVICE_NAME)
+system, appconfig = bootstrap_service(SERVICE_NAME)
+
+mqtt_secrets = load_secrets(MqttSecrets, SERVICE_NAME, system.connect_timeout_seconds)
 
 
 class TelegramSecrets(BaseSettings):

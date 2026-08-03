@@ -15,13 +15,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
 from shared.claude import call_structured
 
 from .config import anthropic_secrets, appconfig
 
-_client = Anthropic(api_key=anthropic_secrets.api_key)
+_client = AsyncAnthropic(api_key=anthropic_secrets.api_key)
 
 EXTRACTION_SYSTEM_PROMPT = (
     "Analyze the photo of a home appliance/device's label or manual that the "
@@ -50,7 +50,7 @@ def _image_block(attachment: str) -> dict[str, Any]:
 
 
 async def extract_device_data(attachment: str) -> dict[str, Any]:
-    result = call_structured(
+    result = await call_structured(
         _client,
         appconfig.get("claudeModel", "claude-sonnet-5"),
         system=EXTRACTION_SYSTEM_PROMPT,

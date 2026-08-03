@@ -1,13 +1,14 @@
-"""notifier-scheduler: checks pending reminders and publishes alerts to the bus.
+"""notifier-scheduler: a cron heartbeat, nothing more.
 
-Cron-like via APScheduler. Unlike the rest of the services here, this one
-doesn't keep a persistent MQTT connection: it only ever publishes (never
-consumes/subscribes to anything), so each scheduled run opens a fresh
-connection, publishes whatever's due, and closes it — simpler than managing
-the lifecycle of a persistent connection that would sit idle most of the time.
-`connectTimeoutMs` is used here as the wait before a single retry if the
-connection attempt fails; if it fails again, it's left for the next scheduler
-tick.
+Used to fetch due reminders from PostgREST and publish alerts to MQTT itself.
+Under the "orchestrator owns every external connection" redesign, all of that
+logic moved to orchestrator (see orchestrator/orchestrator/reminders.py) —
+this service's only remaining job is to ping
+`POST /internal/reminders/check` on a timer. It still exists as its own
+service (rather than just being an APScheduler job inside orchestrator)
+because of the one thing it still owns: its own Postgres-backed jobstore, so
+scheduled ticks survive a container restart independently of orchestrator's
+own process lifecycle.
 """
 
 from __future__ import annotations
@@ -15,63 +16,33 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import aiomqtt
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-from shared.mqtt_client import mqtt_client
-from shared.postgrest_client import PostgrestClient
+from shared.internal_client import InternalApiClient
 from shared.settings import watch_appconfig
 
-from .config import SERVICE_NAME, appconfig, mqtt_secrets, postgrest_secrets, scheduler_secrets, system
-from .reminders import dispatch_reminder, fetch_due_reminders, reschedule_or_mark_sent
+from .config import SERVICE_NAME, appconfig, orchestrator_secrets, scheduler_secrets, system
 
 logger = logging.getLogger("notifier_scheduler")
 
-
-async def _dispatch_all(pg: PostgrestClient, due: list[dict]) -> None:
-    for attempt in (1, 2):
-        try:
-            async with mqtt_client(mqtt_secrets) as client:
-                for reminder in due:
-                    try:
-                        await dispatch_reminder(pg, client, reminder)
-                        await reschedule_or_mark_sent(pg, reminder)
-                    except Exception:
-                        logger.exception("Error processing reminder %s", reminder.get("id"))
-            return
-        except aiomqtt.MqttError as exc:
-            if attempt == 1:
-                logger.warning(
-                    "MQTT connection failed (%s) — retrying in %.1fs", exc, system.connect_timeout_seconds
-                )
-                await asyncio.sleep(system.connect_timeout_seconds)
-            else:
-                logger.error("Couldn't connect to MQTT after retrying — will try again next cycle")
+_orchestrator_client = InternalApiClient(orchestrator_secrets.url, SERVICE_NAME)
 
 
-async def check_reminders(pg: PostgrestClient) -> None:
-    try:
-        due = await fetch_due_reminders(pg)
-    except Exception:
-        logger.exception("Error fetching pending reminders")
-        return
-
-    if not due:
-        logger.debug("No pending reminders this cycle")
-        return
-
-    await _dispatch_all(pg, due)
+async def check_reminders() -> None:
+    response = await _orchestrator_client.post("/internal/reminders/check", json={})
+    if response is not None:
+        logger.info("Reminder check completed: %s", response.json())
+    # If it's None, InternalApiClient already logged the failure after its own
+    # retries — nothing more to do, the next scheduled tick will try again.
 
 
 async def main() -> None:
     check_interval = appconfig.get("checkIntervalSeconds", 300)
     logger.info(
-        "notifier-scheduler starting up (check interval: %ss, PostgREST: %s)",
+        "notifier-scheduler starting up (check interval: %ss, orchestrator: %s)",
         check_interval,
-        postgrest_secrets.url,
+        orchestrator_secrets.url,
     )
-    pg = PostgrestClient(postgrest_secrets.url)
     scheduler = AsyncIOScheduler(jobstores={"default": SQLAlchemyJobStore(url=scheduler_secrets.postgres_dsn)})
 
     async def _on_config_change(changed_keys: set[str]) -> None:
@@ -88,7 +59,6 @@ async def main() -> None:
             check_reminders,
             trigger="interval",
             seconds=check_interval,
-            args=[pg],
             id="check_reminders",
             replace_existing=True,
         )
@@ -100,13 +70,11 @@ async def main() -> None:
         finally:
             config_task.cancel()
     except Exception:
-        logger.exception(
-            "Unrecoverable error in notifier-scheduler — check POSTGRES_DSN (jobstore) and connectivity to PostgREST"
-        )
+        logger.exception("Unrecoverable error in notifier-scheduler — check POSTGRES_DSN (jobstore)")
         raise
     finally:
         scheduler.shutdown(wait=False)
-        await pg.aclose()
+        await _orchestrator_client.aclose()
 
 
 if __name__ == "__main__":

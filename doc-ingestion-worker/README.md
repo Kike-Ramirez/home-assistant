@@ -2,33 +2,36 @@
 
 Turns a photo of a device's label or manual into structured data (brand, model, specs, category) using Claude vision. Runs as its own queue with bounded concurrency, specifically so a slow vision extraction never blocks the normal chat flow for anyone else.
 
+This service has **no MQTT and no PostgREST connection** — under the "`orchestrator` owns every external/shared connection" design (see the root [README's design notes](../README.md#design-notes)), it's reached over a small internal HTTP API instead. The one deliberate exception is Claude itself: this service keeps its own `AsyncAnthropic` client purely for vision extraction, since routing that specific call through `orchestrator` would mean a circular hop (`orchestrator` → this service → back to `orchestrator` for Claude → back to this service) for no benefit.
+
 ## How it works
 
-- Consumes `home/events/doc_ingestion` — requests published by `orchestrator` whenever a user sends a photo during the device-onboarding flow.
+- Exposes `POST /extract` (aiohttp, port `8080` — not exposed to the host, only reachable from `orchestrator` over the Docker network). `orchestrator` calls this whenever a user sends a photo during the device-onboarding flow.
+- The endpoint replies `202 Accepted` immediately (fire-and-forget) and processes the extraction in a background task — a vision call can take a while, and this keeps `orchestrator` from blocking on it.
 - Each request is processed under a semaphore (`maxConcurrency` concurrent extractions at a time); the rest queue up rather than piling on Claude's API all at once.
 - The photo attachment can be either a public URL (Telegram's file URLs) or a `data:` base64 URI (from `web-adapter`, whose server usually isn't reachable outside the LAN) — this service detects which one it got and builds the right kind of image block for Claude either way.
 - Extraction uses the same structured-output mechanism as `orchestrator` (`shared.claude.call_structured`): the result is forced into a Pydantic model (`DeviceExtraction`) and validated, with a retry if Claude's response doesn't match the expected shape — no unchecked `json.loads` on free-text output.
-- Publishes the result (success + extracted data, or failure + error message) back to `home/events/doc_ingestion_result`, which `orchestrator` consumes to show the user a draft to confirm.
+- Once extraction finishes, calls back to `orchestrator`'s `POST /internal/doc-ingestion/result` with the result (success + extracted data, or failure + error message), which `orchestrator` uses to show the user a draft to confirm. This callback goes through `shared.internal_client.InternalApiClient` — a thin `httpx` wrapper with a couple of bounded retries, not an infinite reconnect loop, since it's a one-off call tied to a request that's already in flight.
 - Never writes to Postgres directly — this service only ever proposes a draft; `orchestrator` is the one that saves it once the user confirms.
 
 ## Configuration
 
-### Secrets (`.env`)
+Like every service here, this reads its config from the **shared** files at the repo root — see the [root README](../README.md#configuration-one-shared-appconfig--one-shared-secrets-file) for why. Below are just the parts this service actually reads.
 
-Copy `.env.example` to `.env` and fill in:
+### Secrets (`barbarasecrets.env`)
+
+Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecrets.env):
 
 | Variable | Required | Description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | yes | Your Claude API key — see the note below |
-| `MQTT_HOST` | yes | MQTT broker hostname |
-| `MQTT_PORT` | no (default `8883`) | MQTT broker port |
-| `MQTT_USER` | yes | MQTT username |
-| `MQTT_PASSWORD` | yes | MQTT password |
-| `MQTT_TLS_ENABLED` | no (default `true`) | Whether to use TLS for the MQTT connection |
+| `ORCHESTRATOR_URL` | yes | Base URL of `orchestrator`'s internal API, e.g. `http://orchestrator:8080` |
 
-No `POSTGREST_URL` needed — see above, this service never talks to Postgres.
+No `MQTT_*` or `POSTGREST_URL` needed — see above, this service has no MQTT or Postgres connection of its own.
 
-### AppConfig (`appconfig.json`)
+### AppConfig (`appconfigDev/appconfig.json`)
+
+`doc-ingestion-worker`'s own slice of the repo-root [`appconfigDev/appconfig.json`](../appconfigDev/appconfig.json):
 
 ```json
 {
@@ -37,6 +40,7 @@ No `POSTGREST_URL` needed — see above, this service never talks to Postgres.
       "debugLevel": "info",
       "connectTimeoutMs": 15000
     },
+    "port": 8080,
     "maxConcurrency": 2,
     "claudeModel": "claude-sonnet-5"
   }
@@ -45,6 +49,7 @@ No `POSTGREST_URL` needed — see above, this service never talks to Postgres.
 
 | Key | Default | Description |
 |---|---|---|
+| `port` | `8080` | Port for the internal HTTP API (`/extract`). Not exposed to the host — reachable only from `orchestrator` over the Docker network. **Not hot-reloadable** — same reason as `web-adapter`'s `port` |
 | `maxConcurrency` | `2` | Max number of photo extractions running at the same time |
 | `claudeModel` | `claude-sonnet-5` | Which Claude model to use for vision extraction |
 

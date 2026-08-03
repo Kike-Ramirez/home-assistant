@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import aiomqtt
-
 from shared.message import MessageType, NormalizedMessage, outbound_topic
+from shared.mqtt_client import ManagedMqttConnection
 
 
-async def reply(client: aiomqtt.Client, incoming: NormalizedMessage, text: str) -> None:
+async def reply(client: ManagedMqttConnection, incoming: NormalizedMessage, text: str) -> None:
     await reply_raw(client, incoming.channel, incoming.user_id, incoming.conversation_id, text)
 
 
-async def reply_raw(client: aiomqtt.Client, channel: str, user_id: str, conversation_id: str, text: str) -> None:
+async def reply_raw(client: ManagedMqttConnection, channel: str, user_id: str, conversation_id: str, text: str) -> None:
     outgoing = NormalizedMessage(
         channel=channel,
         user_id=user_id,
@@ -19,4 +18,4 @@ async def reply_raw(client: aiomqtt.Client, channel: str, user_id: str, conversa
         type=MessageType.TEXT,
         content=text,
     )
-    await client.publish(outbound_topic(channel, user_id), payload=outgoing.model_dump_json(), qos=1)
+    await client.publish(outbound_topic(channel, user_id), outgoing.model_dump_json(), qos=1)

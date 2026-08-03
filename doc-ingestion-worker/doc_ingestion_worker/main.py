@@ -1,6 +1,12 @@
-"""doc-ingestion-worker: consumer of home/events/doc_ingestion with bounded concurrency.
+"""doc-ingestion-worker: extraction jobs over HTTP, bounded concurrency.
 
-Doesn't block the normal chat flow (this can take a while) — CLAUDE.md section 4.
+No MQTT connection anymore (see CLAUDE.md, "orchestrator owns every external
+connection"): orchestrator fires a job at `POST /extract` (fire-and-forget —
+this responds immediately, the actual extraction happens in the background),
+and this service calls back to orchestrator's
+`POST /internal/doc-ingestion/result` once it's done. Still doesn't block the
+normal chat flow (extraction can take a while) — that's what the semaphore is
+for, same as before.
 """
 
 from __future__ import annotations
@@ -8,25 +14,28 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from shared.message import DOC_INGESTION_REQUEST_TOPIC, DOC_INGESTION_RESULT_TOPIC, DocIngestionRequest, DocIngestionResult
-from shared.mqtt_client import maintain_mqtt_connection
+from aiohttp import web
+from shared.internal_client import InternalApiClient
+from shared.message import DocIngestionRequest, DocIngestionResult
 from shared.settings import watch_appconfig
 
-from .config import SERVICE_NAME, appconfig, mqtt_secrets, system
+from .config import SERVICE_NAME, appconfig, orchestrator_secrets, system
 from .extractor import extract_device_data
 
 logger = logging.getLogger("doc_ingestion_worker")
 
 _max_concurrency = appconfig.get("maxConcurrency", 2)
 _semaphore = asyncio.Semaphore(_max_concurrency)
+_orchestrator_client = InternalApiClient(orchestrator_secrets.url, SERVICE_NAME)
+
+_background_tasks: set[asyncio.Task] = set()
 
 
-async def _process(client, payload: bytes) -> None:
-    # The whole body is covered by the try — including the final publish, so
+async def _process(request: DocIngestionRequest) -> None:
+    # The whole body is covered by the try — including the final callback, so
     # a network failure while replying doesn't get lost as an orphaned
     # exception in a fire-and-forget task.
     try:
-        request = DocIngestionRequest.model_validate_json(payload)
         async with _semaphore:
             try:
                 draft = await extract_device_data(request.attachment_url)
@@ -49,22 +58,22 @@ async def _process(client, payload: bytes) -> None:
                     error=str(exc),
                 )
 
-        await client.publish(DOC_INGESTION_RESULT_TOPIC, payload=result.model_dump_json(), qos=1)
+        await _orchestrator_client.post("/internal/doc-ingestion/result", json=result.model_dump())
     except Exception:
         logger.exception("Unrecoverable error processing a doc-ingestion request")
 
 
-_background_tasks: set[asyncio.Task] = set()
+async def handle_extract(request: web.Request) -> web.Response:
+    body = await request.json()
+    doc_request = DocIngestionRequest.model_validate(body)
 
+    task = asyncio.create_task(_process(doc_request))
+    # Strong reference until it's done — otherwise the event loop could
+    # garbage-collect the task mid-flight (asyncio docs, "Important").
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
-async def on_connect(client) -> None:
-    await client.subscribe(DOC_INGESTION_REQUEST_TOPIC)
-    async for message in client.messages:
-        task = asyncio.create_task(_process(client, message.payload))
-        # Strong reference until it's done — otherwise the event loop could
-        # garbage-collect the task mid-flight (asyncio docs, "Important").
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+    return web.json_response({"accepted": True}, status=202)
 
 
 async def _on_config_change(changed_keys: set[str]) -> None:
@@ -80,14 +89,25 @@ async def _on_config_change(changed_keys: set[str]) -> None:
         logger.info("Max concurrency updated to %s (semaphore recreated)", _max_concurrency)
 
 
-async def main() -> None:
+async def on_startup(app: web.Application) -> None:
     logger.info("doc-ingestion-worker starting up (max concurrency: %s)", _max_concurrency)
-    config_task = asyncio.create_task(watch_appconfig(SERVICE_NAME, system, appconfig, on_change=_on_config_change))
-    try:
-        await maintain_mqtt_connection(mqtt_secrets, system, on_connect)
-    finally:
-        config_task.cancel()
+    app["config_task"] = asyncio.create_task(
+        watch_appconfig(SERVICE_NAME, system, appconfig, on_change=_on_config_change)
+    )
+
+
+async def on_shutdown(app: web.Application) -> None:
+    app["config_task"].cancel()
+    await _orchestrator_client.aclose()
+
+
+def build_app() -> web.Application:
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    app.router.add_post("/extract", handle_extract)
+    return app
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(build_app(), port=appconfig.get("port", 8080))

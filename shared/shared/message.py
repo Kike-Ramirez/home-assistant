@@ -33,27 +33,27 @@ def outbound_topic(channel: str, user_id: str) -> str:
     return f"home/outbound/{channel}/{user_id}"
 
 
-# Internal event topics between orchestrator <-> doc-ingestion-worker.
-DOC_INGESTION_REQUEST_TOPIC = "home/events/doc_ingestion"
-DOC_INGESTION_RESULT_TOPIC = "home/events/doc_ingestion_result"
-
-REMINDER_EVENT_TOPIC = "home/events/reminder"
-PRICE_ALERT_EVENT_TOPIC = "home/events/price_alert"
-FIRMWARE_UPDATE_EVENT_TOPIC = "home/events/firmware_update"
+# Note: doc-ingestion-worker <-> orchestrator and notifier-scheduler ->
+# orchestrator used to be MQTT event topics here. They're now direct HTTP
+# calls to orchestrator's internal API instead (see shared/internal_client.py
+# and each service's README) — orchestrator is the only service left with an
+# MQTT connection besides the two channel adapters, so the bus only carries
+# home/inbound/* and home/outbound/* now.
 
 
 class DocIngestionRequest(BaseModel):
-    """Published by orchestrator when the user sends a photo (flow 1)."""
+    """Body of orchestrator's POST to doc-ingestion-worker's `/extract` (flow 1)."""
 
     conversation_id: str  # home.conversation id (uuid), for internal correlation
-    channel_conversation_id: str  # conversation_id from the MQTT contract (channel's chat/thread)
+    channel_conversation_id: str  # conversation_id from the message contract (channel's chat/thread)
     channel: str
     user_id: str
     attachment_url: str
 
 
 class DocIngestionResult(BaseModel):
-    """Published by doc-ingestion-worker with the extracted data (draft, not yet saved)."""
+    """Body of doc-ingestion-worker's POST back to orchestrator's
+    `/internal/doc-ingestion/result`, with the extracted data (draft, not yet saved)."""
 
     conversation_id: str  # home.conversation id (uuid)
     channel_conversation_id: str

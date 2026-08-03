@@ -1,9 +1,0 @@
-{
-  "notifier_scheduler": {
-    "system": {
-      "debugLevel": "info",
-      "connectTimeoutMs": 15000
-    },
-    "checkIntervalSeconds": 300
-  }
-}

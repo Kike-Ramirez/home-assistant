@@ -15,13 +15,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 from shared.claude import call_structured, extract_text
 
 from .config import anthropic_secrets, appconfig
 
-_client = Anthropic(api_key=anthropic_secrets.api_key)
+_client = AsyncAnthropic(api_key=anthropic_secrets.api_key)
 
 _WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 
@@ -36,9 +36,9 @@ def _web_search_tools() -> list[dict[str, Any]]:
     return [_WEB_SEARCH_TOOL] if appconfig.get("webSearchEnabled", True) else []
 
 
-def _ask(system_prompt: str, user_content: str) -> str:
+async def _ask(system_prompt: str, user_content: str) -> str:
     """Free-text (non-structured) question, with `web_search` available."""
-    response = _client.messages.create(
+    response = await _client.messages.create(
         model=_claude_model(),
         max_tokens=appconfig.get("maxTokens", 4096),
         system=system_prompt,
@@ -78,9 +78,9 @@ TROUBLESHOOTING_SYSTEM_PROMPT = (
 ) + _LANGUAGE_INSTRUCTION
 
 
-def ask_troubleshooting(devices: list[dict[str, Any]], question: str) -> str:
+async def ask_troubleshooting(devices: list[dict[str, Any]], question: str) -> str:
     inventory = _format_devices(devices)
-    return _ask(TROUBLESHOOTING_SYSTEM_PROMPT, f"Home inventory:\n{inventory}\n\nQuestion: {question}")
+    return await _ask(TROUBLESHOOTING_SYSTEM_PROMPT, f"Home inventory:\n{inventory}\n\nQuestion: {question}")
 
 
 # =============================================================================
@@ -93,8 +93,8 @@ class IntentClassification(BaseModel):
     topic: str | None = None
 
 
-def classify_intent(user_text: str) -> IntentClassification:
-    return call_structured(
+async def classify_intent(user_text: str) -> IntentClassification:
+    return await call_structured(
         _client,
         _claude_model(),
         system=(
@@ -119,8 +119,8 @@ class ConfirmationResult(BaseModel):
     confirmed: bool | None  # None if the reply is ambiguous
 
 
-def interpret_confirmation(user_reply: str) -> bool | None:
-    result = call_structured(
+async def interpret_confirmation(user_reply: str) -> bool | None:
+    result = await call_structured(
         _client,
         _claude_model(),
         system="Determine whether the user is confirming or rejecting a proposal, in whatever language or phrasing they used.",
@@ -147,8 +147,8 @@ class CourseResult(BaseModel):
     questions: list[QuizQuestion]
 
 
-def generate_course(topic: str) -> CourseResult:
-    return call_structured(
+async def generate_course(topic: str) -> CourseResult:
+    return await call_structured(
         _client,
         _claude_model(),
         system=(
@@ -168,9 +168,9 @@ class QuizAnswerResult(BaseModel):
     selected_index: int | None  # None if it's unclear which option is meant
 
 
-def interpret_quiz_answer(question: str, options: list[str], user_reply: str) -> int | None:
+async def interpret_quiz_answer(question: str, options: list[str], user_reply: str) -> int | None:
     options_text = "\n".join(f"{i}: {opt}" for i, opt in enumerate(options))
-    result = call_structured(
+    result = await call_structured(
         _client,
         _claude_model(),
         system=(
@@ -198,6 +198,26 @@ REPLACEMENT_SYSTEM_PROMPT = (
 ) + _LANGUAGE_INSTRUCTION
 
 
-def ask_replacement(existing_devices: list[dict[str, Any]], request_text: str) -> str:
+async def ask_replacement(existing_devices: list[dict[str, Any]], request_text: str) -> str:
     inventory = _format_devices(existing_devices, include_standards=True)
-    return _ask(REPLACEMENT_SYSTEM_PROMPT, f"Devices currently in the house:\n{inventory}\n\nUser's request: {request_text}")
+    return await _ask(REPLACEMENT_SYSTEM_PROMPT, f"Devices currently in the house:\n{inventory}\n\nUser's request: {request_text}")
+
+
+# =============================================================================
+# Reminders (notifier-scheduler triggers this, orchestrator does the work)
+# =============================================================================
+
+REMINDER_SYSTEM_PROMPT = (
+    "You're a home assistant writing a short, friendly proactive notification "
+    "(one or two sentences) to send to a user about something that's due — a "
+    "maintenance reminder, a price drop, or a firmware update. There's no "
+    "user message to reply to here (this is a notification, not a reply), so "
+    "write it in Spanish — that's this household's language."
+)
+
+
+async def word_reminder(kind: str, payload: dict[str, Any]) -> str:
+    """Only called when a reminder doesn't already carry a ready-made
+    `payload.message` — asks Claude to turn the raw kind/payload into a
+    proper notification."""
+    return await _ask(REMINDER_SYSTEM_PROMPT, f"Reminder kind: {kind}\nDetails: {payload}")

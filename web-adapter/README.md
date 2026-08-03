@@ -19,9 +19,11 @@ Same [normalized message contract](../shared/README.md) as every other channel a
 
 ## Configuration
 
-### Secrets (`.env`)
+Like every service here, this reads its config from the **shared** files at the repo root — see the [root README](../README.md#configuration-one-shared-appconfig--one-shared-secrets-file) for why. Below are just the parts this service actually reads.
 
-Copy `.env.example` to `.env` and fill in:
+### Secrets (`barbarasecrets.env`)
+
+Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecrets.env):
 
 | Variable | Required | Description |
 |---|---|---|
@@ -33,7 +35,9 @@ Copy `.env.example` to `.env` and fill in:
 
 No external API credentials needed — that's the point of this being the fallback channel.
 
-### AppConfig (`appconfig.json`)
+### AppConfig (`appconfigDev/appconfig.json`)
+
+`web-adapter`'s own slice of the repo-root [`appconfigDev/appconfig.json`](../appconfigDev/appconfig.json):
 
 ```json
 {

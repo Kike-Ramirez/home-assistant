@@ -7,9 +7,9 @@ services:
         SERVICE: telegram-adapter
         MODULE: telegram_adapter
     env_file:
-      - telegram-adapter/.env
+      - barbarasecrets.env
     volumes:
-      - ./telegram-adapter/appconfig.json:/app/appconfig.json:ro
+      - ./appconfigDev:/appconfig:ro
     networks:
       - barbaraServices
 
@@ -21,9 +21,9 @@ services:
         SERVICE: web-adapter
         MODULE: web_adapter
     env_file:
-      - web-adapter/.env
+      - barbarasecrets.env
     volumes:
-      - ./web-adapter/appconfig.json:/app/appconfig.json:ro
+      - ./appconfigDev:/appconfig:ro
     ports:
       - "8090:8090"
     networks:
@@ -37,9 +37,9 @@ services:
         SERVICE: orchestrator
         MODULE: orchestrator
     env_file:
-      - orchestrator/.env
+      - barbarasecrets.env
     volumes:
-      - ./orchestrator/appconfig.json:/app/appconfig.json:ro
+      - ./appconfigDev:/appconfig:ro
     networks:
       - barbaraServices
 
@@ -51,9 +51,9 @@ services:
         SERVICE: doc-ingestion-worker
         MODULE: doc_ingestion_worker
     env_file:
-      - doc-ingestion-worker/.env
+      - barbarasecrets.env
     volumes:
-      - ./doc-ingestion-worker/appconfig.json:/app/appconfig.json:ro
+      - ./appconfigDev:/appconfig:ro
     networks:
       - barbaraServices
 
@@ -65,9 +65,9 @@ services:
         SERVICE: notifier-scheduler
         MODULE: notifier_scheduler
     env_file:
-      - notifier-scheduler/.env
+      - barbarasecrets.env
     volumes:
-      - ./notifier-scheduler/appconfig.json:/app/appconfig.json:ro
+      - ./appconfigDev:/appconfig:ro
     networks:
       - barbaraServices
 
@@ -75,6 +75,15 @@ services:
 # NOT declared here: they're Barbara Marketplace services, already deployed
 # on the node. Our services connect to them by hostname/Barbara's internal
 # DNS over this same network (CLAUDE.md section 2).
+#
+# barbarasecrets.env and appconfigDev/ (both at the repo root) are shared by
+# every service here, on purpose: that's how Barbara Secrets and Appconfig
+# actually work on a real node — one store per app/project, injected
+# identically into every container, not one per docker-compose service. Each
+# service's config.py only reads the top-level appconfig key (and the env
+# vars) it actually needs; see shared/shared/settings.py and each service's
+# README. This mirrors Barbara's own boilerplate exactly:
+# https://github.com/Barbaraedge/training_barbara_apps_development/tree/main/boilerplate_01_python
 networks:
   barbaraServices:
     driver: bridge
