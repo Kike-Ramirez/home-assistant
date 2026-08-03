@@ -56,16 +56,20 @@ _doc_ingestion_client = InternalApiClient(doc_ingestion_worker_secrets.url, "orc
 _PAUSE_TOOL_NAMES = actions.ASYNC_TOOL_NAMES | actions.CONFIRM_TOOL_NAMES
 
 
+def _loop_kwargs() -> dict[str, Any]:
+    """Shared config for every `run_agent_loop`/`resume_agent_loop` call — one
+    spot to read live from appconfig instead of the two call sites drifting."""
+    return {
+        "max_tokens": llm.max_tokens(),
+        "async_tool_names": _PAUSE_TOOL_NAMES,
+        "max_iterations_fallback": llm.MAX_ITERATIONS_FALLBACK,
+        "web_search": appconfig.get("webSearchEnabled", True),
+    }
+
+
 async def _run_agent_loop(pg: PostgrestClient, history: list[dict[str, Any]]) -> AgentTurnResult:
     return await llm.client.run_agent_loop(
-        llm.SYSTEM_PROMPT,
-        actions.TOOL_SCHEMAS,
-        actions.make_executor(pg),
-        history,
-        max_tokens=llm.max_tokens(),
-        async_tool_names=_PAUSE_TOOL_NAMES,
-        max_iterations_fallback=llm.MAX_ITERATIONS_FALLBACK,
-        web_search=appconfig.get("webSearchEnabled", True),
+        llm.SYSTEM_PROMPT, actions.TOOL_SCHEMAS, actions.make_executor(pg), history, **_loop_kwargs()
     )
 
 
@@ -78,10 +82,7 @@ async def _resume_agent_loop(
         actions.make_executor(pg),
         history,
         resolved_tool_results=resolved_tool_results,
-        max_tokens=llm.max_tokens(),
-        async_tool_names=_PAUSE_TOOL_NAMES,
-        max_iterations_fallback=llm.MAX_ITERATIONS_FALLBACK,
-        web_search=appconfig.get("webSearchEnabled", True),
+        **_loop_kwargs(),
     )
 
 
@@ -252,7 +253,15 @@ async def handle_doc_ingestion_result(request: web.Request) -> web.Response:
     body = await request.json()
     result = DocIngestionResult.model_validate(body)
     conversation = await get_conversation_by_id(pg, result.conversation_id)
-    pending_tool_use_id = conversation["state"]["pending_agent_turn"]
+    pending_tool_use_id = conversation["state"].get("pending_agent_turn")
+    if not pending_tool_use_id:
+        # Nothing to resume — the conversation moved on (or was never
+        # pending) before this callback arrived. Retrying wouldn't help, so
+        # accept the request and drop it instead of a raw KeyError/500.
+        logger.warning(
+            "doc-ingestion callback for conversation %s with no pending turn — dropping", result.conversation_id
+        )
+        return web.json_response({"ok": False})
 
     tool_result: Any = result.draft_device if (result.success and result.draft_device) else {
         "success": False,

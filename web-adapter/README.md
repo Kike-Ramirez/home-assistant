@@ -15,7 +15,11 @@ Same [normalized message contract](../shared/README.md) as every other channel a
 
 ### Why attachments here work differently from Telegram
 
-`telegram-adapter` can just hand Claude a public `api.telegram.org` URL. This server usually only lives on the LAN, so Claude's servers couldn't fetch a URL pointing at it — instead, the browser sends the file as a `data:<mime>;base64,...` URI directly in the attachment. `shared.claude.build_content_blocks` (used by `orchestrator`) handles both transports transparently: a base64 image/document goes straight into the content block, while a document that's still a URL (Telegram's case) gets downloaded and base64-encoded there instead, since Claude's `document` content block — unlike `image` — has no `url` source type.
+Gemini has no `url` source type at all — every attachment gets downloaded and sent as inline bytes, whether it started as a public `api.telegram.org` URL or a base64 `data:` URI from here. So in practice `telegram-adapter` and `web-adapter` attachments already end up handled the same way by `shared.gemini_client`; the only difference is where the bytes come from (an HTTP fetch vs. decoding what the browser already sent).
+
+### No real approval buttons — a text fallback instead
+
+This is the secondary/debug channel, so it doesn't render Telegram-style inline buttons. When `orchestrator`'s Human-in-the-Loop gate needs an approve/reject decision, the outbound message's `actions` (e.g. "✅ Aprobar" / "❌ Rechazar") are appended to the message text as a hint instead — you just reply with a plain "sí"/"no" (or "aprobar"/"rechazar"), which `orchestrator` parses the same way it would a Telegram user typing instead of tapping a button.
 
 ## Configuration
 
@@ -57,4 +61,4 @@ No external API credentials needed — that's the point of this being the fallba
 
 ## Trying it out
 
-Once the service is running, open `http://<host>:8090` in a browser. Type a message, hit send, or attach a photo/document — what happens next (onboarding, troubleshooting, attaching it to an existing device) is Claude's call, not this adapter's.
+Once the service is running, open `http://<host>:8090` in a browser. Type a message, hit send, or attach a photo/document — what happens next (onboarding, troubleshooting, attaching it to an existing device) is Gemini's call, not this adapter's.

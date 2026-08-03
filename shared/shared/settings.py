@@ -134,7 +134,7 @@ class ConfigAccessor:
     Same usage as a dict (`.get(key, default)`), but if the key isn't there
     it logs a WARNING before falling back to the default — so an incomplete
     configuration shows up in the logs instead of failing silently. The
-    warning only fires once per key (some parameters, like the Claude model,
+    warning only fires once per key (some parameters, like the LLM model,
     get read on every request — warning every time would flood the logs
     without adding anything new).
     """

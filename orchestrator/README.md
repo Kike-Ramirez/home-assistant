@@ -1,41 +1,58 @@
 # orchestrator
 
-The brain. Every inbound message from every channel ends up here; Claude decides what to do with it via tool calls, and this service just executes them — there's no flow dispatch or intent branching of its own. It's **stateless** on purpose — all conversation state (the Claude message transcript) lives in Postgres (via PostgREST), not in process memory, so it could scale to multiple replicas behind the same MQTT topics without any of them stepping on each other.
+The brain. Every inbound message from every channel ends up here; Gemini decides what to do with it via tool calls, and this service just executes them (or, for a write, gates it on human approval first) — there's no flow dispatch or intent branching of its own. It's **stateless** on purpose — all conversation state (the Gemini message transcript) lives in Postgres (via PostgREST), not in process memory, so it could scale to multiple replicas behind the same MQTT topics without any of them stepping on each other.
 
-It's also the **only service connected to MQTT, PostgREST, and the Claude API** (aside from `telegram-adapter`/`web-adapter`, which own their own MQTT connections as channel adapters, and `doc-ingestion-worker`'s narrow Claude-vision exception — see the root [README's design notes](../README.md#design-notes)). `doc-ingestion-worker` and `notifier-scheduler` have no direct connection to any of those systems; they reach `orchestrator` through the small internal HTTP API described below instead.
+It's also the **only service connected to MQTT, PostgREST, and the Gemini API** (aside from `telegram-adapter`/`web-adapter`, which own their own MQTT connections as channel adapters, and `doc-ingestion-worker`'s narrow Gemini-vision exception — see the root [README's design notes](../README.md#design-notes)). `doc-ingestion-worker` has no direct connection to any of those systems; it reaches `orchestrator` through the small internal HTTP API described below instead.
 
 ## How it works
 
 Consumes `home/inbound/+/+` (any channel, any user) over MQTT. For each inbound message, `main.py::handle_inbound`:
 
-1. Builds this turn's Claude content blocks (text + any image/document attachments — see `shared.claude.build_content_blocks`) and appends them to `conversation.state.history`.
-2. Runs `shared.claude.run_agent_loop` with the full tool list from `tools.py` and the system prompt from `claude_client.py`. Claude decides everything from here — which tool(s) to call, or none, and what to say.
-3. Persists the updated history and sends whatever Claude's final text was back to the channel.
+1. Builds this turn's Gemini content (text + any image/document attachments) and appends it to `conversation.state.history`.
+2. Runs `shared.gemini_client.GeminiClient.run_agent_loop` with the full tool list from `actions.py` and the system prompt from `llm.py`. Gemini decides everything from here — which tool(s) to call, or none, and what to say.
+3. Persists the updated history and sends whatever Gemini's final text was back to the channel.
 
-The one tool that isn't executed inline is `extract_device_data` (vision extraction via `doc-ingestion-worker`) — it needs an HTTP round trip that can't be awaited inside the loop, so calling it pauses the whole turn (`conversation.state.pending_agent_turn`) until the result comes back over the internal API below.
+Two things can pause a turn instead of running inline:
 
-It also runs a small internal HTTP server (aiohttp, port `8080` — not exposed to the host, only reachable over the Docker network) for the two services that used to talk over MQTT/PostgREST directly:
+- **`extract_device_data`** (vision extraction via `doc-ingestion-worker`) needs an HTTP round trip that can't be awaited inside the loop — calling it pauses the turn (`conversation.state.pending_agent_turn`) until the result comes back over the internal API below.
+- **`create_device` / `update_device` / `retire_device`** (writes to the inventory) pause the same way, but instead of async work, `orchestrator` asks the user to approve/reject via the channel — a Telegram message with Aprobar/Rechazar buttons, or a plain "sí"/"no" text reply on channels without real buttons (see `security_guard.py`). The action only actually reaches PostgREST once approved.
+
+Only one of these can be pending per conversation at a time — a second inbound message while one is pending gets a "still waiting" reply instead of starting a new turn.
+
+It also runs a small internal HTTP server (aiohttp, port `8080` — not exposed to the host, only reachable over the Docker network):
 
 | Endpoint | Called by | What it does |
 |---|---|---|
 | `POST /internal/doc-ingestion/result` | `doc-ingestion-worker` | Delivers the result of a `/extract` request once extraction finishes (success + draft device data, or failure + error) — resumes the paused agent-loop turn via `resume_agent_loop` |
-| `POST /internal/reminders/check` | `notifier-scheduler` | Triggers one full reminder-check cycle: reads due reminders from PostgREST, sends the ones that are ready, words the ones that need Claude's help via `word_reminder()`, and reschedules/marks-sent as appropriate. Returns `{"processed": <count>}` |
 
-None of this uses keyword matching or a fixed intent enum. **Every** decision — what to do with a message, whether a photo is a new device or something else, whether the user confirmed a draft or corrected it — is Claude choosing (or not choosing) a tool, driven by the full conversation it can see. `doc-ingestion-worker`'s vision extraction still validates its output with `shared.claude.call_structured()` (forces a tool call via `tool_choice`, validates against a Pydantic model, retries on mismatch — same mechanism a library like `instructor` would give you, without the extra dependency weight), but that's the one place structured extraction still matters; nothing in `orchestrator` classifies intent anymore.
+None of this uses keyword matching or a fixed intent enum. **Every** decision — what to do with a message, whether a photo is a new device or something else, whether the user confirmed a draft or corrected it — is Gemini choosing (or not choosing) a tool, driven by the full conversation it can see. `doc-ingestion-worker`'s vision extraction still validates its output with `GeminiClient.call_structured()` (JSON-schema-constrained output, validated against a Pydantic model, retries on mismatch), but that's the one place structured extraction still matters; nothing in `orchestrator` classifies intent anymore.
 
-### The tools (`tools.py`)
+### The modules
 
-| Tool | What it does |
+| Module | Role |
 |---|---|
-| `list_devices` | Returns the household's inventory (optionally with each device's supported standards/protocols) — Claude calls this itself when it needs the data, instead of it being force-fed into every prompt |
-| `create_device` | Saves a new device — typically after `extract_device_data` + the user confirming a draft, or from a plain description |
-| `update_device` | Edits an existing device — corrections, added detail |
-| `attach_document` | Attaches a manual/photo/note to an existing device (`home.device_document`) |
-| `extract_device_data` | Vision-extracts a photo already in the conversation as a device label/manual — the one asynchronous tool, see above |
-| `schedule_reminder` | Creates a `home.reminder` row for anything the user asks to be reminded about |
-| `web_search` / `web_fetch` | Anthropic's built-in server tools — current info, and fetching a URL the user shared |
+| `llm.py` | Instantiates the one `GeminiClient` this service uses, and holds `SYSTEM_PROMPT` — all the conversational behavior lives here, as a prompt, not as code branches |
+| `actions.py` | The tool schemas Gemini sees, and the plain function dispatcher that executes them against PostgREST (`registry.py`) — no judgment, it runs whatever it's told |
+| `security_guard.py` | The Human-in-the-Loop gate: builds the approval prompt/buttons, parses a yes/no reply, and is the one place a write tool actually reaches `actions.dispatch()` |
+| `registry.py` | PostgREST read/write surface for `home.device`/`device_document` — what `actions.py`'s handlers call into |
+| `conversation.py` | `home.conversation` CRUD (get-or-create by channel, state patch) |
+| `messaging.py` | Publishes replies to `home/outbound/<channel>/<user_id>` |
 
-Troubleshooting answers, course lessons+quizzes, and replacement recommendations are **not** tools — they're just Claude's own final text, using `list_devices`/`web_search`/`web_fetch` as needed. Quiz grading works the same way: Claude re-reads its own prior turns from the conversation history rather than a tracked question index.
+### The tools (`actions.py`)
+
+| Tool | Approval | What it does |
+|---|---|---|
+| `list_devices` | auto | Returns the household's inventory (optionally with each device's supported standards/protocols) |
+| `get_device` | auto | Full detail for one device: attributes, standards, attached documents |
+| `get_compatible_devices` | auto | Devices/standards compatible with a given one (`home.compatible_devices` RPC) — replacement/purchase recommendations |
+| `attach_document` | auto | Attaches a manual/photo/note to an existing device (`home.device_document`) — purely additive, nothing destroyed |
+| `create_device` | **Human-in-the-Loop** | Saves a new device — typically after `extract_device_data` + the user confirming a draft, or from a plain description |
+| `update_device` | **Human-in-the-Loop** | Edits an existing device — corrections, added detail |
+| `retire_device` | **Human-in-the-Loop** | Soft-deletes a device (`status='retired'`) — drops out of `list_devices`, history kept |
+| `extract_device_data` | n/a (async) | Vision-extracts a photo already in the conversation as a device label/manual — the one tool with real async work behind it, see above |
+| `web_search` | auto (togglable) | Gemini's built-in `google_search` grounding tool — current info the model doesn't already know |
+
+Troubleshooting answers, course lessons+quizzes, and replacement recommendations are **not** tools — they're just Gemini's own final text, using `list_devices`/`get_device`/`get_compatible_devices`/`web_search` as needed. Quiz grading works the same way: Gemini re-reads its own prior turns from the conversation history rather than a tracked question index.
 
 ## Configuration
 
@@ -47,8 +64,7 @@ Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecret
 
 | Variable | Required | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | yes (if `engine` is `gemini`, the default) | Your Google Gemini API key — see below |
-| `ANTHROPIC_API_KEY` | yes (if `engine` is `anthropic`) | Your Claude API key — Anthropic is still a selectable engine, just not the default anymore |
+| `GEMINI_API_KEY` | yes | Your Google Gemini API key — see below |
 | `POSTGREST_URL` | yes | Base URL of the PostgREST instance, e.g. `http://postgrest:3000` |
 | `DOC_INGESTION_WORKER_URL` | yes | Base URL of `doc-ingestion-worker`'s internal API, e.g. `http://doc-ingestion-worker:8080` |
 | `MQTT_HOST` | yes | MQTT broker hostname |
@@ -73,8 +89,8 @@ If any required variable is missing, the service logs an error naming it exactly
       "connectTimeoutMs": 15000
     },
     "port": 8080,
-    "engine": "gemini",
     "model": "gemini-flash-latest",
+    "temperature": 0.2,
     "maxTokens": 4096,
     "webSearchEnabled": true
   }
@@ -83,19 +99,14 @@ If any required variable is missing, the service logs an error naming it exactly
 
 | Key | Default | Description |
 |---|---|---|
-| `port` | `8080` | Port for the internal HTTP API (`/internal/doc-ingestion/result`, `/internal/reminders/check`). Not exposed to the host — reachable only from `doc-ingestion-worker`/`notifier-scheduler` over the Docker network. **Not hot-reloadable** — same reason as `web-adapter`'s `port` (the server's already bound the socket) |
-| `engine` | `gemini` | Which LLM engine to use — `gemini` or `anthropic` (see [`shared/shared/engines/`](../shared/shared/engines)). Only read once, at process start (needs a restart to switch) |
-| `model` | `gemini-flash-latest` (or `claude-sonnet-5` for the `anthropic` engine) | Which model that engine calls for everything in this service — `gemini-flash-latest` is a Google-maintained alias that always points at their current flash-tier model, avoiding hardcoded model names being deprecated out from under this default |
+| `port` | `8080` | Port for the internal HTTP API (`/internal/doc-ingestion/result`). Not exposed to the host — reachable only from `doc-ingestion-worker` over the Docker network. **Not hot-reloadable** — same reason as `web-adapter`'s `port` (the server's already bound the socket) |
+| `model` | `gemini-flash-latest` | Which Gemini model to call for everything in this service — a Google-maintained alias that always points at their current flash-tier model, avoiding a hardcoded dated model name being deprecated out from under this default. Only read once, at process start (needs a restart to change) |
+| `temperature` | `0.2` | Sampling temperature for the agent loop — lower favors consistent, predictable tool-calling behavior over creative variance. Only read once, at process start |
 | `maxTokens` | `4096` | Max output tokens per agent-loop turn |
-| `webSearchEnabled` | `true` | Whether to give the model its web-search tool(s) (read live each turn — no restart needed to flip it) |
+| `webSearchEnabled` | `true` | Whether to give the model its web-search tool (read live each turn — no restart needed to flip it) |
 
-Everything except `engine`/`model` (which are only read at construction) hot-reloads — see [`shared/README.md`](../shared/README.md).
+Everything except `model`/`temperature` (only read at construction) hot-reloads — see [`shared/README.md`](../shared/README.md).
 
-### Getting an API key
+### Getting a Gemini API key
 
-- **Gemini (default)**: [Google AI Studio](https://aistudio.google.com/apikey) → create an API key → that's your `GEMINI_API_KEY`.
-- **Anthropic** (if you switch `engine` to `anthropic`): [Anthropic Console](https://console.anthropic.com/) → **API Keys** → create a key → that's your `ANTHROPIC_API_KEY`.
-
-Keep an eye on usage/billing for whichever provider is active — this service calls it on essentially every user message.
-
-> The Gemini engine hasn't been exercised against the live API yet (built from the `google-genai` package's type definitions + mocked-response tests) — see CLAUDE.md section 10. `web_search`/`web_fetch` on the Anthropic engine use the `_20260209` dynamic-filtering tool variants, confirmed current as of the session that added them.
+[Google AI Studio](https://aistudio.google.com/apikey) → create an API key → that's your `GEMINI_API_KEY`. Keep an eye on usage/billing — this service calls Gemini on essentially every user message.

@@ -18,7 +18,7 @@ class MessageType(str, Enum):
 class AttachmentKind(str, Enum):
     IMAGE = "image"
     DOCUMENT = "document"
-    AUDIO = "audio"  # modeled for future use — no adapter captures it and Claude's Messages API
+    AUDIO = "audio"  # modeled for future use — no adapter captures it and Gemini's API
     # has no audio content-block type, so nothing consumes it yet (CLAUDE.md section 10).
 
 
@@ -60,12 +60,11 @@ def outbound_topic(channel: str, user_id: str) -> str:
     return f"home/outbound/{channel}/{user_id}"
 
 
-# Note: doc-ingestion-worker <-> orchestrator and notifier-scheduler ->
-# orchestrator used to be MQTT event topics here. They're now direct HTTP
-# calls to orchestrator's internal API instead (see shared/internal_client.py
-# and each service's README) — orchestrator is the only service left with an
-# MQTT connection besides the two channel adapters, so the bus only carries
-# home/inbound/* and home/outbound/* now.
+# Note: doc-ingestion-worker <-> orchestrator used to be MQTT event topics
+# here. They're now direct HTTP calls to orchestrator's internal API instead
+# (see shared/internal_client.py and each service's README) — orchestrator is
+# the only service left with an MQTT connection besides the two channel
+# adapters, so the bus only carries home/inbound/* and home/outbound/* now.
 
 
 class DocIngestionRequest(BaseModel):

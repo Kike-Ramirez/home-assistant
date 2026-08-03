@@ -75,7 +75,9 @@ async def _attachment_part(attachment: Attachment, http_client: httpx.AsyncClien
 
 
 async def _attachment_parts(attachments: list[Attachment], http_client: httpx.AsyncClient | None) -> list[dict[str, Any]]:
-    parts: list[dict[str, Any]] = []
+    """Fetches/decodes every attachment concurrently (`asyncio.gather`, not a
+    sequential loop) — matters for a message with several photos, since each
+    non-data-URI attachment is its own network round trip."""
     client = http_client
     owns_client = False
     try:
@@ -83,12 +85,10 @@ async def _attachment_parts(attachments: list[Attachment], http_client: httpx.As
         if client is None and needs_fetch:
             client = httpx.AsyncClient()
             owns_client = True
-        for attachment in attachments:
-            parts.append(await _attachment_part(attachment, client))  # type: ignore[arg-type]
+        return list(await asyncio.gather(*(_attachment_part(a, client) for a in attachments)))  # type: ignore[arg-type]
     finally:
         if owns_client and client is not None:
             await client.aclose()
-    return parts
 
 
 def _tool_declarations(tools: list[dict[str, Any]]) -> list[types.Tool]:
@@ -214,6 +214,7 @@ class GeminiClient:
         tools: list[dict[str, Any]],
         tool_executor: ToolExecutor,
         working: list[dict[str, Any]],
+        *,
         max_tokens: int,
         max_iterations: int,
         async_tool_names: frozenset[str],
@@ -236,9 +237,10 @@ class GeminiClient:
                 return AgentTurnResult(done=True, final_text=text or "", messages=working)
 
             if any(fc.name in async_tool_names for fc in function_calls):
-                # Don't execute ANY tool in this batch — same reasoning as the
-                # Anthropic engine: a side-effecting call must never run only
-                # to have its result discarded when the batch needs pausing.
+                # Don't execute ANY tool in this batch — a side-effecting call
+                # (e.g. a write tool awaiting Human-in-the-Loop approval) must
+                # never run only to have its result discarded because the
+                # batch needs pausing.
                 return AgentTurnResult(done=False, final_text=text or None, messages=working)
 
             results = await asyncio.gather(*(_run_one_tool(tool_executor, fc.id, fc.name, fc.args or {}) for fc in function_calls))
@@ -260,7 +262,15 @@ class GeminiClient:
         web_search: bool = True,
     ) -> AgentTurnResult:
         return await self._loop(
-            system, tools, tool_executor, list(messages), max_tokens, max_iterations, async_tool_names, max_iterations_fallback, web_search
+            system,
+            tools,
+            tool_executor,
+            list(messages),
+            max_tokens=max_tokens,
+            max_iterations=max_iterations,
+            async_tool_names=async_tool_names,
+            max_iterations_fallback=max_iterations_fallback,
+            web_search=web_search,
         )
 
     async def resume_agent_loop(
@@ -291,7 +301,15 @@ class GeminiClient:
         results = await asyncio.gather(*(_run(p) for p in pending_parts))
         working = [*working, {"role": "user", "parts": results}]
         return await self._loop(
-            system, tools, tool_executor, working, max_tokens, max_iterations, async_tool_names, max_iterations_fallback, web_search
+            system,
+            tools,
+            tool_executor,
+            working,
+            max_tokens=max_tokens,
+            max_iterations=max_iterations,
+            async_tool_names=async_tool_names,
+            max_iterations_fallback=max_iterations_fallback,
+            web_search=web_search,
         )
 
     async def call_structured(

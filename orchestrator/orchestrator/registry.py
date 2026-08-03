@@ -2,7 +2,7 @@
 surface the agent loop's tools call into (`orchestrator/actions.py`).
 
 "Which device is relevant" is never filtered with our own heuristics —
-Claude calls `list_devices` itself when it needs the inventory, and decides
+Gemini calls `list_devices` itself when it needs the inventory, and decides
 which one a question is about.
 """
 
@@ -44,7 +44,7 @@ async def create_device(pg: PostgrestClient, draft: dict[str, Any]) -> dict[str,
 
 
 async def update_device(pg: PostgrestClient, device_id: str, **fields: Any) -> dict[str, Any]:
-    """Patches only the fields Claude actually supplied — e.g. `update_device(pg,
+    """Patches only the fields Gemini actually supplied — e.g. `update_device(pg,
     device_id, brand="Bosch")` leaves everything else untouched. `None` values
     are dropped rather than sent, since PostgREST would otherwise happily
     overwrite a field with NULL when the caller just meant "not specified"."""
