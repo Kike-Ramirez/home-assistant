@@ -25,12 +25,12 @@ from shared.engines import get_engine
 from .config import SERVICE_NAME, appconfig, system
 
 ENGINE_NAME = appconfig.get("engine", "gemini")
-_DEFAULT_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-sonnet-5"}
+_DEFAULT_MODELS = {"gemini": "gemini-flash-latest", "anthropic": "claude-sonnet-5"}
 
 engine = get_engine(
     ENGINE_NAME,
     SERVICE_NAME,
-    appconfig.get("model", _DEFAULT_MODELS.get(ENGINE_NAME, "gemini-2.5-flash")),
+    appconfig.get("model", _DEFAULT_MODELS.get(ENGINE_NAME, "gemini-flash-latest")),
     system.connect_timeout_seconds,
 )
 

@@ -9,7 +9,7 @@ services:
     env_file:
       - barbarasecrets.env
     volumes:
-      - ./appconfigDev:/appconfig:ro
+      - ./appconfigDev:/appconfig
     networks:
       - barbaraServices
 
@@ -23,7 +23,7 @@ services:
     env_file:
       - barbarasecrets.env
     volumes:
-      - ./appconfigDev:/appconfig:ro
+      - ./appconfigDev:/appconfig
     ports:
       - "8090:8090"
     networks:
@@ -39,7 +39,7 @@ services:
     env_file:
       - barbarasecrets.env
     volumes:
-      - ./appconfigDev:/appconfig:ro
+      - ./appconfigDev:/appconfig
     networks:
       - barbaraServices
 
@@ -53,7 +53,7 @@ services:
     env_file:
       - barbarasecrets.env
     volumes:
-      - ./appconfigDev:/appconfig:ro
+      - ./appconfigDev:/appconfig
     networks:
       - barbaraServices
 
@@ -67,7 +67,7 @@ services:
     env_file:
       - barbarasecrets.env
     volumes:
-      - ./appconfigDev:/appconfig:ro
+      - ./appconfigDev:/appconfig
     networks:
       - barbaraServices
 

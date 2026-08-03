@@ -74,7 +74,7 @@ If any required variable is missing, the service logs an error naming it exactly
     },
     "port": 8080,
     "engine": "gemini",
-    "model": "gemini-2.5-flash",
+    "model": "gemini-flash-latest",
     "maxTokens": 4096,
     "webSearchEnabled": true
   }
@@ -85,7 +85,7 @@ If any required variable is missing, the service logs an error naming it exactly
 |---|---|---|
 | `port` | `8080` | Port for the internal HTTP API (`/internal/doc-ingestion/result`, `/internal/reminders/check`). Not exposed to the host — reachable only from `doc-ingestion-worker`/`notifier-scheduler` over the Docker network. **Not hot-reloadable** — same reason as `web-adapter`'s `port` (the server's already bound the socket) |
 | `engine` | `gemini` | Which LLM engine to use — `gemini` or `anthropic` (see [`shared/shared/engines/`](../shared/shared/engines)). Only read once, at process start (needs a restart to switch) |
-| `model` | `gemini-2.5-flash` (or `claude-sonnet-5` for the `anthropic` engine) | Which model that engine calls for everything in this service |
+| `model` | `gemini-flash-latest` (or `claude-sonnet-5` for the `anthropic` engine) | Which model that engine calls for everything in this service — `gemini-flash-latest` is a Google-maintained alias that always points at their current flash-tier model, avoiding hardcoded model names being deprecated out from under this default |
 | `maxTokens` | `4096` | Max output tokens per agent-loop turn |
 | `webSearchEnabled` | `true` | Whether to give the model its web-search tool(s) (read live each turn — no restart needed to flip it) |
 

@@ -18,7 +18,7 @@
       "connectTimeoutMs": 15000
     },
     "engine": "gemini",
-    "model": "gemini-2.5-flash",
+    "model": "gemini-flash-latest",
     "maxTokens": 4096,
     "webSearchEnabled": true,
     "port": 8080
@@ -30,7 +30,7 @@
     },
     "maxConcurrency": 2,
     "engine": "gemini",
-    "model": "gemini-2.5-flash",
+    "model": "gemini-flash-latest",
     "port": 8080
   },
   "notifier_scheduler": {

@@ -23,13 +23,13 @@ from shared.message import Attachment, AttachmentKind
 
 from .config import SERVICE_NAME, appconfig, system
 
-_DEFAULT_MODELS = {"gemini": "gemini-2.5-flash", "anthropic": "claude-sonnet-5"}
+_DEFAULT_MODELS = {"gemini": "gemini-flash-latest", "anthropic": "claude-sonnet-5"}
 _ENGINE_NAME = appconfig.get("engine", "gemini")
 
 engine = get_engine(
     _ENGINE_NAME,
     SERVICE_NAME,
-    appconfig.get("model", _DEFAULT_MODELS.get(_ENGINE_NAME, "gemini-2.5-flash")),
+    appconfig.get("model", _DEFAULT_MODELS.get(_ENGINE_NAME, "gemini-flash-latest")),
     system.connect_timeout_seconds,
 )
 

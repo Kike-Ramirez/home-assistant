@@ -82,6 +82,48 @@ def _tool_declarations(tools: list[dict[str, Any]]) -> list[types.Tool]:
     return [types.Tool(function_declarations=declarations)]
 
 
+def _model_parts_from_response(response: Any) -> list[dict[str, Any]]:
+    """Rebuilds the model turn's parts from the raw response, preserving each
+    part's `thought_signature` — Gemini requires it to be echoed back verbatim
+    on any later turn that replays a `function_call` part, and it's lost if we
+    reconstruct parts from the `response.text`/`response.function_calls`
+    convenience accessors instead of the raw parts."""
+    candidate = response.candidates[0] if response.candidates else None
+    raw_parts = candidate.content.parts if candidate and candidate.content and candidate.content.parts else []
+    parts: list[dict[str, Any]] = []
+    for part in raw_parts:
+        part_dict: dict[str, Any] = {}
+        if part.text:
+            part_dict["text"] = part.text
+        if part.function_call:
+            part_dict["function_call"] = {
+                "id": part.function_call.id,
+                "name": part.function_call.name,
+                "args": part.function_call.args or {},
+            }
+        if part.thought_signature:
+            # base64 text, not raw bytes — this ends up in `conversation.state.history`,
+            # persisted as JSON via PostgREST, which can't encode a bytes value.
+            part_dict["thought_signature"] = base64.b64encode(part.thought_signature).decode("ascii")
+        if part_dict:
+            parts.append(part_dict)
+    return parts
+
+
+def _decode_thought_signatures(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reverses `_model_parts_from_response`'s base64 encoding right before a
+    request goes out — the API wants the raw bytes back, not the JSON-safe text."""
+    decoded = []
+    for message in messages:
+        parts = []
+        for part in message.get("parts", []):
+            if isinstance(part, dict) and isinstance(part.get("thought_signature"), str):
+                part = {**part, "thought_signature": base64.b64decode(part["thought_signature"])}
+            parts.append(part)
+        decoded.append({**message, "parts": parts})
+    return decoded
+
+
 def _stringify_tool_result(result: Any) -> dict[str, Any]:
     """Gemini's `function_response.response` wants a dict, not a bare string."""
     if isinstance(result, dict):
@@ -127,9 +169,16 @@ class GeminiEngine:
 
     def _config(self, system: str, tools: list[dict[str, Any]], max_tokens: int, web_search: bool) -> types.GenerateContentConfig:
         gemini_tools = _tool_declarations(tools)
+        tool_config = None
         if web_search:
             gemini_tools.append(types.Tool(google_search=types.GoogleSearch()))
-        return types.GenerateContentConfig(system_instruction=system, tools=gemini_tools or None, max_output_tokens=max_tokens)
+            if tools:
+                # Gemini rejects mixing a server-side tool (google_search) with
+                # custom function declarations unless this is set explicitly.
+                tool_config = types.ToolConfig(include_server_side_tool_invocations=True)
+        return types.GenerateContentConfig(
+            system_instruction=system, tools=gemini_tools or None, tool_config=tool_config, max_output_tokens=max_tokens
+        )
 
     async def _loop(
         self,
@@ -146,12 +195,13 @@ class GeminiEngine:
         config = self._config(system, tools, max_tokens, web_search)
 
         for _ in range(max_iterations):
-            response = await self._client.aio.models.generate_content(model=self._model_name, contents=working, config=config)
+            response = await self._client.aio.models.generate_content(
+                model=self._model_name, contents=_decode_thought_signatures(working), config=config
+            )
             function_calls = response.function_calls or []
             text = response.text
 
-            model_parts: list[dict[str, Any]] = [{"text": text}] if text else []
-            model_parts.extend({"function_call": {"id": fc.id, "name": fc.name, "args": fc.args or {}}} for fc in function_calls)
+            model_parts = _model_parts_from_response(response)
             working = [*working, {"role": "model", "parts": model_parts or [{"text": ""}]}]
 
             if not function_calls:
