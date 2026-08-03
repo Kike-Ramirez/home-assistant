@@ -1,16 +1,16 @@
-"""Extracts structured data from a photo of a device's label/manual, via the
-active LLM engine's vision + structured-output support (`shared.engines`).
+"""Extracts structured data from a photo of a device's label/manual, via
+Gemini's vision + structured-output support (`shared.gemini_client`).
 
 The attachment can be a public URL (telegram-adapter, which exposes
 `api.telegram.org/file/...`) or a base64 data URI (web-adapter, whose server
-is usually only reachable on the LAN and therefore isn't a URL most engines
-could fetch themselves) — the message contract (CLAUDE.md section 5)
-accounted for this from the start, and `Engine.call_structured` handles
-either transport internally.
+is usually only reachable on the LAN and therefore isn't a URL Gemini could
+fetch itself) — the message contract (CLAUDE.md section 5) accounted for
+this from the start, and `GeminiClient.call_structured` handles either
+transport internally.
 
-Uses `Engine.call_structured` (tool_choice/JSON-mode + Pydantic + retry,
-depending on the engine) instead of asking for free-text JSON and trusting
-`json.loads` with no schema validation at all.
+Uses `GeminiClient.call_structured` (JSON-mode + Pydantic + retry) instead of
+asking for free-text JSON and trusting `json.loads` with no schema validation
+at all.
 """
 
 from __future__ import annotations
@@ -18,19 +18,17 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel, Field
-from shared.engines import get_engine
+from shared.gemini_client import GeminiClient
 from shared.message import Attachment, AttachmentKind
+from shared.settings import GeminiSecrets, load_secrets
 
 from .config import SERVICE_NAME, appconfig, system
 
-_DEFAULT_MODELS = {"gemini": "gemini-flash-latest", "anthropic": "claude-sonnet-5"}
-_ENGINE_NAME = appconfig.get("engine", "gemini")
-
-engine = get_engine(
-    _ENGINE_NAME,
-    SERVICE_NAME,
-    appconfig.get("model", _DEFAULT_MODELS.get(_ENGINE_NAME, "gemini-flash-latest")),
-    system.connect_timeout_seconds,
+_secrets = load_secrets(GeminiSecrets, SERVICE_NAME, system.connect_timeout_seconds)
+client = GeminiClient(
+    _secrets.api_key,
+    appconfig.get("model", "gemini-flash-latest"),
+    temperature=appconfig.get("temperature", 0.1),  # low — extraction should be as deterministic as possible
 )
 
 EXTRACTION_SYSTEM_PROMPT = (
@@ -52,7 +50,7 @@ class DeviceExtraction(BaseModel):
 
 
 async def extract_device_data(attachment: str) -> dict[str, Any]:
-    result = await engine.call_structured(
+    result = await client.call_structured(
         EXTRACTION_SYSTEM_PROMPT,
         "Extract this device's data.",
         [Attachment(kind=AttachmentKind.IMAGE, url_or_data=attachment)],

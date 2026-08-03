@@ -21,11 +21,6 @@ services:
     networks:
       - barbaraServices
 
-  notifier-scheduler:
-    image: kikeramirez/home-assistant-notifier-scheduler:latest
-    networks:
-      - barbaraServices
-
 # No `build:` here on purpose: on a Barbara node, these images are pulled
 # ready-made from Docker Hub instead of built on the node itself. Build and
 # push them with ./build-and-push-images.sh (repo root) before deploying —

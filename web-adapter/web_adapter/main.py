@@ -101,11 +101,23 @@ async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+def _render_text(msg: NormalizedMessage) -> str:
+    """web-adapter is the secondary/debug channel — no real button UI, so an
+    approval prompt (`msg.actions`, e.g. Aprobar/Rechazar) just gets a plain
+    text hint appended. The user replies with a normal text message ("sí"/
+    "no", among others orchestrator recognizes — see `_parse_confirmation_text`)."""
+    text = msg.content or ""
+    if msg.actions:
+        options = " / ".join(action.label for action in msg.actions)
+        text = f"{text}\n\n({options} — responde con sí o no)"
+    return text
+
+
 async def _handle_outbound_message(mqtt_message) -> None:
     msg = NormalizedMessage.model_validate_json(mqtt_message.payload)
     ws = _connections.get(msg.user_id)
     if ws is not None and not ws.closed:
-        await ws.send_str(json.dumps({"text": msg.content or ""}))
+        await ws.send_str(json.dumps({"text": _render_text(msg)}))
 
 
 async def on_startup(app: web.Application) -> None:

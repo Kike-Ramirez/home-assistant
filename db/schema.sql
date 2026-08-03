@@ -191,25 +191,6 @@ CREATE TABLE IF NOT EXISTS home.message (
 CREATE INDEX IF NOT EXISTS idx_message_conversation ON home.message (conversation_id, created_at);
 
 -- =============================================================================
--- 7. Reminders / alerts (notifier-scheduler)
--- =============================================================================
-CREATE TABLE IF NOT EXISTS home.reminder (
-    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       text NOT NULL DEFAULT 'home',
-    device_id       uuid REFERENCES home.device(id) ON DELETE CASCADE,
-    user_id         uuid REFERENCES home.app_user(id),
-    kind            text NOT NULL,      -- 'maintenance' | 'price_alert' | 'firmware_update'
-    payload         jsonb NOT NULL DEFAULT '{}'::jsonb,
-    scheduled_at    timestamptz NOT NULL,
-    recurrence_rule text,               -- optional RRULE for recurring reminders
-    status          text NOT NULL DEFAULT 'pending', -- pending | sent | cancelled
-    sent_at         timestamptz,
-    created_at      timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_reminder_due ON home.reminder (status, scheduled_at);
-
--- =============================================================================
 -- 8. RPC function: devices compatible with a given one.
 --    Exposed by PostgREST as POST /rpc/compatible_devices
 --    Combines: (a) explicit device_compatibility entries,
@@ -253,7 +234,7 @@ DECLARE
 BEGIN
     FOREACH t IN ARRAY ARRAY['device_type','standard','device','device_standard',
                               'device_compatibility','device_document','app_user',
-                              'conversation','message','reminder']
+                              'conversation','message']
     LOOP
         EXECUTE format('ALTER TABLE home.%I ENABLE ROW LEVEL SECURITY;', t);
     END LOOP;
@@ -275,8 +256,6 @@ CREATE POLICY tenant_isolation ON home.device_document
 CREATE POLICY tenant_isolation ON home.app_user
     USING (tenant_id = home.current_tenant());
 CREATE POLICY tenant_isolation ON home.conversation
-    USING (tenant_id = home.current_tenant());
-CREATE POLICY tenant_isolation ON home.reminder
     USING (tenant_id = home.current_tenant());
 
 CREATE POLICY tenant_isolation ON home.device_standard

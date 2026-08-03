@@ -10,7 +10,6 @@ members = [
     "web-adapter",
     "orchestrator",
     "doc-ingestion-worker",
-    "notifier-scheduler",
 ]
 
 [build-system]

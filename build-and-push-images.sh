@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Builds and pushes the 5 service images this project deploys as, one Docker
+# Builds and pushes the 4 service images this project deploys as, one Docker
 # Hub repo per service, tagged "home-assistant-<service>" so they're easy to
 # find alongside any other project on the same account.
 #
 # Usage:
-#   ./build-and-push-images.sh                      # build + push all 5
+#   ./build-and-push-images.sh                      # build + push all 4
 #   ./build-and-push-images.sh orchestrator          # build + push just one service
 #   ./build-and-push-images.sh orchestrator web-adapter   # or a few, by name
-#   ./build-and-push-images.sh --build-only          # skip the push step (all 5, or...)
+#   ./build-and-push-images.sh --build-only          # skip the push step (all 4, or...)
 #   ./build-and-push-images.sh --build-only orchestrator  # ...combine with a service name
 #   DOCKERHUB_USER=someoneelse TAG=0.1.0 ./build-and-push-images.sh
 #
 # Service names match the directory names: telegram-adapter, web-adapter,
-# orchestrator, doc-ingestion-worker, notifier-scheduler.
+# orchestrator, doc-ingestion-worker.
 #
 # Requires you to already be logged in (docker login) — this script never
 # touches your Docker Hub credentials itself.
@@ -27,7 +27,6 @@ ALL_SERVICES=(
   "web-adapter:web_adapter"
   "orchestrator:orchestrator"
   "doc-ingestion-worker:doc_ingestion_worker"
-  "notifier-scheduler:notifier_scheduler"
 )
 
 BUILD_ONLY=false
@@ -71,7 +70,7 @@ else
   done
   if [[ ${#SERVICES[@]} -ne ${#REQUESTED[@]} ]]; then
     echo "Error: one or more requested service names don't match a known service." >&2
-    echo "Known services: telegram-adapter, web-adapter, orchestrator, doc-ingestion-worker, notifier-scheduler" >&2
+    echo "Known services: telegram-adapter, web-adapter, orchestrator, doc-ingestion-worker" >&2
     exit 1
   fi
 fi

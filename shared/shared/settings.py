@@ -91,12 +91,6 @@ class PostgrestSecrets(BaseSettings):
     url: str
 
 
-class AnthropicSecrets(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ANTHROPIC_", extra="ignore")
-
-    api_key: str
-
-
 class GeminiSecrets(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GEMINI_", extra="ignore")
 
@@ -105,9 +99,8 @@ class GeminiSecrets(BaseSettings):
 
 class OrchestratorSecrets(BaseSettings):
     """Where to reach orchestrator's internal API — used by doc-ingestion-worker
-    (to deliver extraction results) and notifier-scheduler (to trigger a
-    reminder check). Not sensitive, but kept alongside the other connection
-    secrets for consistency (same pattern as POSTGREST_URL)."""
+    to deliver extraction results. Not sensitive, but kept alongside the other
+    connection secrets for consistency (same pattern as POSTGREST_URL)."""
 
     model_config = SettingsConfigDict(env_prefix="ORCHESTRATOR_", extra="ignore")
 

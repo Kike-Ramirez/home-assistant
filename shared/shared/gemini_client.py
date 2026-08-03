@@ -1,20 +1,20 @@
-"""Google Gemini implementation of the `Engine` protocol (`base.py`), using
-`google-genai` (`from google import genai`).
+"""The one client for Google Gemini (`google-genai`, `from google import genai`)
+in this codebase — Gemini is the only supported LLM provider (see CLAUDE.md).
+Owns the agent loop (tool-calling turns), multimodal content building, and
+structured-extraction calls. `orchestrator/llm.py` and
+`doc-ingestion-worker/extractor.py` both instantiate `GeminiClient` directly
+from their own secrets/model config — there's no provider abstraction to go
+through.
 
-Deliberate simplifications versus the Anthropic engine, accepted for a fast
-first version (see CLAUDE.md / root README design notes) — revisit only if
-they turn out to matter in practice:
+Deliberate simplifications, accepted for a fast first version (see CLAUDE.md
+/ root README design notes) — revisit only if they turn out to matter in practice:
 - **No prompt caching.** Gemini's `cached_content` is an explicit, coarser
   mechanism (you create and manage a cache object yourself) — not wired up here.
 - **Web search is `google_search` grounding**, not a `web_search`/`web_fetch`
-  pair — there's no separate "fetch this specific URL" tool on this engine.
+  pair — there's no separate "fetch this specific URL" tool.
 - **Every attachment is downloaded and sent as inline bytes.** Gemini has no
-  `url` source type at all (unlike Claude's `image` blocks) — even a public
-  image URL (e.g. Telegram's) has to be fetched here first.
-
-Not yet verified against the live Gemini API (no key available while writing
-this) — the shapes below come from introspecting the installed `google-genai`
-package's type definitions, not from running requests end to end.
+  `url` source type at all — even a public image URL (e.g. Telegram's) has to
+  be fetched here first.
 """
 
 from __future__ import annotations
@@ -22,15 +22,38 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from typing import Any
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, TypeVar
 
 import httpx
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
-from ..message import Attachment, AttachmentKind
-from .base import DEFAULT_MAX_ITERATIONS_FALLBACK, AgentTurnResult, ModelT, ToolExecutor
+from .message import Attachment, AttachmentKind
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
+
+DEFAULT_MAX_ITERATIONS_FALLBACK = "I got stuck in a loop on this one — could you rephrase what you need, or give me more detail?"
+
+
+@dataclass
+class AgentTurnResult:
+    """Outcome of one `run_agent_loop`/`resume_agent_loop` call.
+
+    When `done` is False, `messages` ends with the turn that requested a tool
+    in `async_tool_names` — the caller is expected to persist `messages`
+    verbatim and later call `resume_agent_loop` with that same list plus the
+    resolved result. `final_text` in that case is whatever text the model
+    wrote before making the tool call (often present), used as a provisional
+    reply; it can be empty.
+    """
+
+    done: bool
+    final_text: str | None
+    messages: list[dict[str, Any]]
 
 
 async def _attachment_part(attachment: Attachment, http_client: httpx.AsyncClient) -> dict[str, Any]:
@@ -142,10 +165,11 @@ async def _run_one_tool(executor: ToolExecutor, call_id: str | None, name: str, 
     return {"function_response": {"id": call_id, "name": name, "response": response}}
 
 
-class GeminiEngine:
-    def __init__(self, api_key: str, model_name: str) -> None:
+class GeminiClient:
+    def __init__(self, api_key: str, model_name: str, temperature: float | None = None) -> None:
         self._client = genai.Client(api_key=api_key)
         self._model_name = model_name
+        self._temperature = temperature
 
     async def build_user_message(
         self, text: str | None, attachments: list[Attachment], http_client: httpx.AsyncClient | None = None
@@ -177,7 +201,11 @@ class GeminiEngine:
                 # custom function declarations unless this is set explicitly.
                 tool_config = types.ToolConfig(include_server_side_tool_invocations=True)
         return types.GenerateContentConfig(
-            system_instruction=system, tools=gemini_tools or None, tool_config=tool_config, max_output_tokens=max_tokens
+            system_instruction=system,
+            tools=gemini_tools or None,
+            tool_config=tool_config,
+            max_output_tokens=max_tokens,
+            temperature=self._temperature,
         )
 
     async def _loop(
@@ -285,6 +313,7 @@ class GeminiEngine:
             max_output_tokens=max_tokens,
             response_mime_type="application/json",
             response_json_schema=schema,
+            temperature=self._temperature,
         )
 
         contents: list[dict[str, Any]] = [{"role": "user", "parts": parts}]

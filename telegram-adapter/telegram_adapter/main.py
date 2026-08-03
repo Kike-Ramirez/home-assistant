@@ -16,7 +16,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from shared.message import (
     Attachment,
@@ -107,9 +107,44 @@ async def on_telegram_message(message: Message) -> None:
     await _publish_inbound(msg)
 
 
+@dp.callback_query()
+async def on_telegram_callback(query: CallbackQuery) -> None:
+    """A tap on an inline button sent alongside an approval prompt
+    (`shared.message.Action` — see orchestrator's Human-in-the-Loop flow for
+    `create_device`/`update_device`/`retire_device`). `query.data` is exactly
+    the button's `value` ("approve"/"reject"), forwarded as-is as the content
+    of a CALLBACK-typed inbound message."""
+    await query.answer()  # stop Telegram's client-side loading spinner
+    if query.message is None or query.data is None:
+        return
+
+    user_id = str(query.message.chat.id)
+    msg = NormalizedMessage(
+        channel=CHANNEL,
+        user_id=user_id,
+        conversation_id=str(query.message.chat.id),
+        type=MessageType.CALLBACK,
+        content=query.data,
+    )
+    await _publish_inbound(msg)
+    # Remove the buttons so a second tap can't resolve an already-answered prompt.
+    try:
+        await bot.edit_message_reply_markup(chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=None)
+    except Exception:
+        logger.exception("Couldn't clear the approval buttons after a tap")
+
+
+def _build_reply_markup(msg: NormalizedMessage) -> InlineKeyboardMarkup | None:
+    if not msg.actions:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=action.label, callback_data=action.value) for action in msg.actions]]
+    )
+
+
 async def _handle_outbound_message(mqtt_message) -> None:
     msg = NormalizedMessage.model_validate_json(mqtt_message.payload)
-    await bot.send_message(chat_id=int(msg.user_id), text=msg.content or "")
+    await bot.send_message(chat_id=int(msg.user_id), text=msg.content or "", reply_markup=_build_reply_markup(msg))
 
 
 async def main() -> None:

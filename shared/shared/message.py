@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 class MessageType(str, Enum):
     TEXT = "text"
     COMMAND = "command"
+    CALLBACK = "callback"  # a button press on a previously sent `actions` prompt (see Action below)
     TELEMETRY = "telemetry"  # reserved — Barbara Standard Data Model, not used in the home MVP
 
 
@@ -28,6 +29,18 @@ class Attachment(BaseModel):
     filename: str | None = None
 
 
+class Action(BaseModel):
+    """One button on an outbound message — used for Human-in-the-Loop
+    approval prompts (CLAUDE.md section 6, flow 1's write-tool gate). `value`
+    is what comes back verbatim as the `content` of the resulting inbound
+    CALLBACK message — orchestrator only ever sends "approve"/"reject" today,
+    kept generic here so a future prompt with more than two options doesn't
+    need a schema change."""
+
+    label: str
+    value: str
+
+
 class NormalizedMessage(BaseModel):
     channel: str
     user_id: str
@@ -35,6 +48,7 @@ class NormalizedMessage(BaseModel):
     type: MessageType
     content: str | None = None
     attachments: list[Attachment] = Field(default_factory=list)
+    actions: list[Action] | None = None  # outbound only — renders as inline buttons where the channel supports it
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 

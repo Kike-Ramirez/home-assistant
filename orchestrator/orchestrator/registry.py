@@ -1,5 +1,5 @@
 """Device registry access via PostgREST (schema `home`) — the read/write
-surface the agent loop's tools call into (`orchestrator/tools.py`).
+surface the agent loop's tools call into (`orchestrator/actions.py`).
 
 "Which device is relevant" is never filtered with our own heuristics —
 Claude calls `list_devices` itself when it needs the inventory, and decides
@@ -52,12 +52,40 @@ async def update_device(pg: PostgrestClient, device_id: str, **fields: Any) -> d
     return await pg.patch("device", {"id": f"eq.{device_id}"}, payload)
 
 
+async def retire_device(pg: PostgrestClient, device_id: str) -> dict[str, Any]:
+    """Soft-delete: flips `status` to 'retired' so it drops out of
+    `list_devices` (which filters `status=eq.active`) without erasing history."""
+    return await pg.patch("device", {"id": f"eq.{device_id}"}, {"status": "retired"})
+
+
 async def list_devices(pg: PostgrestClient, include_standards: bool = False) -> list[dict[str, Any]]:
     """Uses PostgREST's resource embedding through the `device_standard` bridge
     table (requires the FKs already defined in db/schema.sql) when standards
     are requested."""
     columns = _DEVICE_COLUMNS_WITH_STANDARDS if include_standards else _DEVICE_COLUMNS
     return await pg.select("device", {"select": columns, "status": "eq.active"})
+
+
+_DEVICE_DETAIL_COLUMNS = (
+    f"{_DEVICE_COLUMNS_WITH_STANDARDS},"
+    "device_document(id,kind,url_or_ref,description,created_at)"
+)
+
+
+async def get_device(pg: PostgrestClient, device_id: str) -> dict[str, Any]:
+    """Full detail for one device — standards and attached documents embedded,
+    for troubleshooting/edit flows where the flat `list_devices` row isn't enough."""
+    rows = await pg.select("device", {"select": _DEVICE_DETAIL_COLUMNS, "id": f"eq.{device_id}"})
+    if not rows:
+        raise ValueError(f"No device with id {device_id!r}")
+    return rows[0]
+
+
+async def get_compatible_devices(pg: PostgrestClient, device_id: str) -> Any:
+    """Exposes the `home.compatible_devices` SQL function (db/schema.sql) via
+    PostgREST's RPC endpoint — combines explicit device_compatibility entries
+    with shared-standard matches."""
+    return await pg.rpc("compatible_devices", {"p_device_id": device_id})
 
 
 async def add_device_document(
@@ -70,16 +98,4 @@ async def add_device_document(
     return await pg.insert(
         "device_document",
         {"device_id": device_id, "kind": kind, "url_or_ref": url_or_ref, "description": description},
-    )
-
-
-async def get_or_create_app_user(pg: PostgrestClient, channel: str, channel_user_id: str) -> dict[str, Any]:
-    """Same upsert-on-conflict pattern as `conversation.get_or_create_conversation`.
-    Called from the `schedule_reminder` tool — the first time anyone schedules
-    a reminder, this closes the previously-open gap of nothing ever creating
-    `home.app_user` rows (CLAUDE.md known gap #3)."""
-    return await pg.upsert_on_conflict(
-        "app_user",
-        {"channel": channel, "channel_user_id": channel_user_id},
-        on_conflict="tenant_id,channel,channel_user_id",
     )

@@ -1,24 +1,33 @@
-"""The tools the active LLM engine can call during the agent loop
-(`shared.engines.Engine.run_agent_loop` — see `shared/shared/engines/`).
+"""The tools Gemini can call during the agent loop (`gemini_client.run_agent_loop`).
 
 Every side-effecting action the model decides on — saving a device, editing
-one, attaching documentation, scheduling a reminder — goes through one of
-these. Orchestrator itself makes no decisions about *when* to call them; it
-only validates shapes (via the JSON schemas below) and executes what the
-model asks for (CLAUDE.md section 10). `TOOL_SCHEMAS` is plain JSON Schema —
-the same list works unchanged regardless of which engine is active.
+one, retiring one, attaching documentation — goes through one of these.
+Orchestrator itself makes no decisions about *when* to call them; it only
+validates shapes (via the JSON schemas below) and executes what the model
+asks for (CLAUDE.md section 10).
 
-`extract_device_data` is deliberately NOT handled by `dispatch()` below — it's
-the one tool with real async work behind it (doc-ingestion-worker's
-fire-and-forget `/extract`), so `orchestrator/main.py` kicks it off directly
-when the loop pauses and injects the result back on resume (see
-`ASYNC_TOOL_NAMES` and `Engine.run_agent_loop`'s `async_tool_names`).
+Two tool sets change the agent loop's normal "call it immediately" behavior:
+
+- `ASYNC_TOOL_NAMES` (`extract_device_data`): real async work behind it
+  (doc-ingestion-worker's fire-and-forget `/extract`) — `orchestrator/main.py`
+  kicks it off directly when the loop pauses and injects the result back on
+  resume.
+- `CONFIRM_TOOL_NAMES` (`create_device`, `update_device`, `retire_device`):
+  writes/destructive changes to the inventory — `orchestrator/main.py` pauses
+  the loop the same way, but instead of doing async work it asks the user to
+  approve/reject via the channel (Human-in-the-Loop) before actually calling
+  `dispatch()`. Both sets are passed together as `run_agent_loop`'s
+  `async_tool_names` — the model-facing pausing behavior is identical, only
+  what `main.py` does while paused differs.
+
+Read-only tools (`list_devices`, `get_device`, `get_compatible_devices`) and
+the purely additive `attach_document` (adds a document reference, never
+overwrites or destroys existing data) execute immediately, no approval needed.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from typing import Any
 
 from shared.postgrest_client import PostgrestClient
@@ -26,6 +35,7 @@ from shared.postgrest_client import PostgrestClient
 from . import registry
 
 ASYNC_TOOL_NAMES = frozenset({"extract_device_data"})
+CONFIRM_TOOL_NAMES = frozenset({"create_device", "update_device", "retire_device"})
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
@@ -92,6 +102,45 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "get_device",
+        "description": (
+            "Returns full detail for a single device: attributes, supported standards/protocols, and "
+            "any attached documents (manuals, label photos, notes). Use this once you've identified "
+            "which device is relevant (e.g. from list_devices) and need its complete detail — "
+            "troubleshooting, reviewing existing documentation, or before editing it."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"device_id": {"type": "string"}},
+            "required": ["device_id"],
+        },
+    },
+    {
+        "name": "get_compatible_devices",
+        "description": (
+            "Returns devices/standards compatible with the given device — use this for replacement or "
+            "new-purchase recommendations, to check what would work with what's already at home."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"device_id": {"type": "string"}},
+            "required": ["device_id"],
+        },
+    },
+    {
+        "name": "retire_device",
+        "description": (
+            "Retires (soft-deletes) a device that's been removed, replaced, or no longer exists at "
+            "home. It stops appearing in list_devices but its history isn't erased. Only call this "
+            "when the user clearly confirms the device is gone — ask first if it's ambiguous."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"device_id": {"type": "string"}},
+            "required": ["device_id"],
+        },
+    },
+    {
         "name": "attach_document",
         "description": (
             "Attaches documentation to an EXISTING device — a manual, a label photo, or a free-form "
@@ -132,75 +181,37 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "name": "schedule_reminder",
-        "description": (
-            "Creates a reminder that gets sent back to the user later — maintenance, a price check, a "
-            "firmware check, or anything else they ask to be reminded about."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "kind": {"type": "string", "enum": ["maintenance", "price_alert", "firmware_update"]},
-                "scheduled_at": {"type": "string", "description": "ISO 8601 timestamp for when to send it."},
-                "message": {"type": "string", "description": "What to tell the user when it fires."},
-                "device_id": {"type": "string", "description": "The device this reminder is about, if any."},
-                "recurrence_rule": {"type": "string", "description": "An iCal RRULE if this should repeat, otherwise omit."},
-            },
-            "required": ["kind", "scheduled_at", "message"],
-        },
-    },
 ]
 
-@dataclass
-class ToolContext:
-    """The bit of per-message context a tool needs beyond its own arguments —
-    today, only `schedule_reminder` uses it (to resolve/create the app_user
-    a reminder belongs to)."""
-
-    channel: str
-    channel_user_id: str  # the channel's native user id (msg.user_id) — e.g. a Telegram chat id
-
-
-async def _schedule_reminder(pg: PostgrestClient, ctx: ToolContext, tool_input: dict[str, Any]) -> dict[str, Any]:
-    user = await registry.get_or_create_app_user(pg, ctx.channel, ctx.channel_user_id)
-    return await pg.insert(
-        "reminder",
-        {
-            "user_id": user["id"],
-            "device_id": tool_input.get("device_id"),
-            "kind": tool_input["kind"],
-            "payload": {"message": tool_input["message"]},
-            "scheduled_at": tool_input["scheduled_at"],
-            "recurrence_rule": tool_input.get("recurrence_rule"),
-        },
-    )
-
-
-async def dispatch(pg: PostgrestClient, ctx: ToolContext, name: str, tool_input: dict[str, Any]) -> Any:
+async def dispatch(pg: PostgrestClient, name: str, tool_input: dict[str, Any]) -> Any:
     if name == "list_devices":
         return await registry.list_devices(pg, include_standards=tool_input.get("include_standards", False))
+    if name == "get_device":
+        return await registry.get_device(pg, tool_input["device_id"])
+    if name == "get_compatible_devices":
+        return await registry.get_compatible_devices(pg, tool_input["device_id"])
     if name == "create_device":
         return await registry.create_device(pg, tool_input)
     if name == "update_device":
         device_id = tool_input["device_id"]
         fields = {k: v for k, v in tool_input.items() if k != "device_id"}
         return await registry.update_device(pg, device_id, **fields)
+    if name == "retire_device":
+        return await registry.retire_device(pg, tool_input["device_id"])
     if name == "attach_document":
         return await registry.add_device_document(
             pg, tool_input["device_id"], tool_input["kind"], tool_input["url_or_data"], tool_input.get("description")
         )
-    if name == "schedule_reminder":
-        return await _schedule_reminder(pg, ctx, tool_input)
     raise ValueError(f"Unknown or unsupported-here tool: {name!r}")
 
 
-def make_executor(pg: PostgrestClient, ctx: ToolContext) -> Callable[[str, dict[str, Any]], Awaitable[Any]]:
-    """A `shared.engines.ToolExecutor` closed over this turn's `pg`/`ctx` —
-    factored out so `orchestrator/main.py` doesn't redefine the same closure
-    at both of its call sites (the normal turn and the doc-ingestion resume)."""
+def make_executor(pg: PostgrestClient) -> Callable[[str, dict[str, Any]], Awaitable[Any]]:
+    """A tool executor closed over this turn's `pg` — factored out so
+    `orchestrator/main.py` doesn't redefine the same closure at each of its
+    call sites (the normal turn, the doc-ingestion resume, and the
+    approval-confirmation resume)."""
 
     async def executor(name: str, tool_input: dict[str, Any]) -> Any:
-        return await dispatch(pg, ctx, name, tool_input)
+        return await dispatch(pg, name, tool_input)
 
     return executor
