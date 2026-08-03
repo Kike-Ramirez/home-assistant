@@ -1,0 +1,81 @@
+services:
+  telegram-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: telegram-adapter
+        MODULE: telegram_adapter
+    env_file:
+      - telegram-adapter/.env
+    volumes:
+      - ./telegram-adapter/appconfig.json:/app/appconfig.json:ro
+    networks:
+      - barbaraServices
+
+  web-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: web-adapter
+        MODULE: web_adapter
+    env_file:
+      - web-adapter/.env
+    volumes:
+      - ./web-adapter/appconfig.json:/app/appconfig.json:ro
+    ports:
+      - "8090:8090"
+    networks:
+      - barbaraServices
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: orchestrator
+        MODULE: orchestrator
+    env_file:
+      - orchestrator/.env
+    volumes:
+      - ./orchestrator/appconfig.json:/app/appconfig.json:ro
+    networks:
+      - barbaraServices
+
+  doc-ingestion-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: doc-ingestion-worker
+        MODULE: doc_ingestion_worker
+    env_file:
+      - doc-ingestion-worker/.env
+    volumes:
+      - ./doc-ingestion-worker/appconfig.json:/app/appconfig.json:ro
+    networks:
+      - barbaraServices
+
+  notifier-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: notifier-scheduler
+        MODULE: notifier_scheduler
+    env_file:
+      - notifier-scheduler/.env
+    volumes:
+      - ./notifier-scheduler/appconfig.json:/app/appconfig.json:ro
+    networks:
+      - barbaraServices
+
+# The MQTT broker (Mosquitto), Postgres, PostgREST, InfluxDB, and Grafana are
+# NOT declared here: they're Barbara Marketplace services, already deployed
+# on the node. Our services connect to them by hostname/Barbara's internal
+# DNS over this same network (CLAUDE.md section 2).
+networks:
+  barbaraServices:
+    driver: bridge
+    name: barbaraServices

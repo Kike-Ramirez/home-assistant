@@ -1,0 +1,16 @@
+[project]
+name = "shared"
+version = "0.1.0"
+description = "Contrato de mensaje MQTT, cliente PostgREST y settings comunes"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "aiomqtt>=2.1",
+    "postgrest>=2.19",  # trae httpx como dependencia propia — no lo declaramos aparte
+    "anthropic>=0.34",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

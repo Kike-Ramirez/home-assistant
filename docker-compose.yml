@@ -1,0 +1,66 @@
+services:
+  telegram-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: telegram-adapter
+        MODULE: telegram_adapter
+    networks:
+      - barbaraServices
+
+  web-adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: web-adapter
+        MODULE: web_adapter
+    ports:
+      - "8090:8090"
+    networks:
+      - barbaraServices
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: orchestrator
+        MODULE: orchestrator
+    networks:
+      - barbaraServices
+
+  doc-ingestion-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: doc-ingestion-worker
+        MODULE: doc_ingestion_worker
+    networks:
+      - barbaraServices
+
+  notifier-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: notifier-scheduler
+        MODULE: notifier_scheduler
+    networks:
+      - barbaraServices
+
+# The MQTT broker (Mosquitto), Postgres, PostgREST, InfluxDB, and Grafana are
+# NOT declared here: they're Barbara Marketplace services, already deployed
+# on the node. Our services connect to them by hostname/Barbara's internal
+# DNS over this same network (CLAUDE.md section 2).
+#
+# Secrets and appconfig aren't declared here either (no env_file, no
+# volumes): on a Barbara node, the platform itself injects them
+# (Secrets/AppConfig of the connector), same as the Industrial Data
+# Simulator or the Marketplace's MQTT broker.
+networks:
+  barbaraServices:
+    driver: bridge
+    name: barbaraServices

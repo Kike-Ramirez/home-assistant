@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Asistente doméstico</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 1rem; background: #111; color: #eee; }
+  #log { border: 1px solid #333; border-radius: 8px; padding: 0.75rem; height: 60vh; overflow-y: auto; margin-bottom: 0.75rem; }
+  .msg { margin-bottom: 0.6rem; white-space: pre-wrap; }
+  .msg.me { color: #8ab4f8; }
+  .msg.bot { color: #ddd; }
+  .msg.system { color: #888; font-style: italic; }
+  form { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
+  input[type=text] { flex: 1; padding: 0.5rem; border-radius: 6px; border: 1px solid #333; background: #1b1b1b; color: #eee; }
+  button { padding: 0.5rem 1rem; border-radius: 6px; border: none; background: #8ab4f8; cursor: pointer; }
+  #photoForm { display: flex; gap: 0.5rem; align-items: center; }
+</style>
+</head>
+<body>
+  <h3>Asistente doméstico</h3>
+  <div id="log"></div>
+
+  <form id="textForm">
+    <input type="text" id="textInput" placeholder="Escribe tu mensaje..." autocomplete="off" required>
+    <button type="submit">Enviar</button>
+  </form>
+
+  <form id="photoForm">
+    <input type="file" id="photoInput" accept="image/*">
+    <input type="text" id="captionInput" placeholder="Comentario (opcional)">
+    <button type="submit">Enviar foto</button>
+  </form>
+
+<script>
+  // Sesión sin login: un id de navegador persistido en localStorage — coherente
+  // con el modelo de confianza del proyecto (red doméstica, un único hogar).
+  let userId = localStorage.getItem("home_assistant_user_id");
+  if (!userId) {
+    userId = crypto.randomUUID();
+    localStorage.setItem("home_assistant_user_id", userId);
+  }
+
+  const log = document.getElementById("log");
+  function appendMessage(text, cssClass) {
+    const div = document.createElement("div");
+    div.className = "msg " + cssClass;
+    div.textContent = text;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws?user_id=${userId}`);
+
+  ws.onopen = () => appendMessage("Conectado.", "system");
+  ws.onclose = () => appendMessage("Desconectado — recarga la página para reconectar.", "system");
+  ws.onmessage = (event) => {
+    const data = JSON.parse(event.data);
+    appendMessage(data.text || "", "bot");
+  };
+
+  document.getElementById("textForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = document.getElementById("textInput");
+    const text = input.value.trim();
+    if (!text) return;
+    ws.send(JSON.stringify({ type: "text", text }));
+    appendMessage(text, "me");
+    input.value = "";
+  });
+
+  document.getElementById("photoForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const fileInput = document.getElementById("photoInput");
+    const caption = document.getElementById("captionInput").value;
+    const file = fileInput.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      // reader.result ya es un data URI completo: "data:image/jpeg;base64,...."
+      ws.send(JSON.stringify({ type: "photo", caption, image_data_uri: reader.result }));
+      appendMessage(caption ? `[foto] ${caption}` : "[foto]", "me");
+      fileInput.value = "";
+      document.getElementById("captionInput").value = "";
+    };
+    reader.readAsDataURL(file);
+  });
+</script>
+</body>
+</html>

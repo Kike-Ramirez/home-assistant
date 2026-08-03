@@ -1,0 +1,20 @@
+# Generic Dockerfile for the 5 services we own — the only real difference
+# between them was the directory name and the Python module name, so instead
+# of keeping 5 near-identical copies, this one is parameterized via build
+# args (see docker-compose.yml / docker-compose-local.yml).
+#
+# Usage: docker build -f Dockerfile.service --build-arg SERVICE=telegram-adapter --build-arg MODULE=telegram_adapter .
+FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+WORKDIR /app
+COPY pyproject.toml uv.lock* ./
+COPY shared ./shared
+
+ARG SERVICE
+COPY ${SERVICE} ./${SERVICE}
+RUN uv sync --package ${SERVICE} --frozen --no-dev || uv sync --package ${SERVICE} --no-dev
+WORKDIR /app/${SERVICE}
+
+ARG MODULE
+ENV SERVICE_MODULE=${MODULE}
+CMD uv run python -m "$SERVICE_MODULE.main"

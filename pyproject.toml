@@ -1,0 +1,18 @@
+[project]
+name = "home-assistant-workspace"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.uv.workspace]
+members = [
+    "shared",
+    "telegram-adapter",
+    "web-adapter",
+    "orchestrator",
+    "doc-ingestion-worker",
+    "notifier-scheduler",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
