@@ -110,3 +110,6 @@ Everything except `model`/`temperature` (only read at construction) hot-reloads 
 ### Getting a Gemini API key
 
 [Google AI Studio](https://aistudio.google.com/apikey) → create an API key → that's your `GEMINI_API_KEY`. Keep an eye on usage/billing — this service calls Gemini on essentially every user message.
+
+- **Hitting quota/rate-limit errors (429)?** New keys default to Google AI Studio's free tier, which has low per-minute/per-day limits. Enable Cloud Billing for the project behind your key (AI Studio → API Keys or Projects page → "Set up Billing", minimum $10 in prepaid credits) to move to the pay-as-you-go tier and raise those limits — see [ai.google.dev/gemini-api/docs/rate-limits](https://ai.google.dev/gemini-api/docs/rate-limits) and the [billing page](https://ai.google.dev/gemini-api/docs/billing). A quota error no longer crashes the conversation either way (see `shared.gemini_client`'s `api_error_fallback` handling), but it does mean Gemini can't respond until the quota resets or billing is enabled.
+- **Treat it like any other credential**: never commit it (it only ever belongs in `barbarasecrets.env`, gitignored), and check usage regularly in AI Studio → Dashboard → Usage — that's also where you'd notice a leaked key being used unexpectedly.
