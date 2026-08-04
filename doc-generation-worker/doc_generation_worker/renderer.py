@@ -7,7 +7,7 @@ requested container format, no content generation of its own.
 
 from __future__ import annotations
 
-from fpdf import FPDF
+from fpdf import FPDF, XPos, YPos
 
 MEDIA_TYPES: dict[str, str] = {
     "pdf": "application/pdf",
@@ -24,6 +24,19 @@ EXTENSIONS: dict[str, str] = {
 }
 
 
+def _pdf_safe(text: str) -> str:
+    """Drops any character the core Helvetica font can't render.
+
+    fpdf2's core (non-embedded) fonts only support `latin-1` — that's fine
+    for Spanish text itself (á/é/í/ó/ú/ñ/¿/¡ are all in latin-1), but the
+    model routinely writes emoji (SYSTEM_PROMPT explicitly encourages them)
+    and "smart" punctuation (em dashes, curly quotes, bullets) that aren't,
+    which otherwise crashes `multi_cell` with `FPDFUnicodeEncodingException`
+    instead of just rendering without them.
+    """
+    return text.encode("latin-1", errors="ignore").decode("latin-1")
+
+
 def _render_pdf(content: str) -> bytes:
     """Minimal text-to-PDF layout: wraps paragraphs, and gives a line a
     bigger/bold font if it looks like a Markdown heading ('# ', '## ', ...) —
@@ -34,15 +47,24 @@ def _render_pdf(content: str) -> bytes:
     pdf.add_page()
     pdf.set_font("Helvetica", size=11)
 
-    for line in content.splitlines() or [""]:
+    for raw_line in content.splitlines() or [""]:
+        line = _pdf_safe(raw_line)
         stripped = line.lstrip("#").strip()
         heading_level = len(line) - len(line.lstrip("#"))
+        # new_x=LMARGIN, new_y=NEXT: multi_cell's own default (new_x=RIGHT)
+        # leaves the cursor pinned at the page's right edge after a line that
+        # fits on one row — any two consecutive non-blank lines without this
+        # then crash with "Not enough horizontal space to render a single
+        # character", since the second call starts with zero width left to
+        # work with. This was the actual, always-reproducible bug behind that
+        # error (not the Unicode content — see _pdf_safe above for that,
+        # separate, issue).
         if heading_level and stripped:
             pdf.set_font("Helvetica", style="B", size=max(11, 16 - 2 * heading_level))
-            pdf.multi_cell(0, 8, stripped)
+            pdf.multi_cell(0, 8, stripped, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.set_font("Helvetica", size=11)
         elif line.strip():
-            pdf.multi_cell(0, 6, line)
+            pdf.multi_cell(0, 6, line, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         else:
             pdf.ln(4)
 
