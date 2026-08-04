@@ -37,11 +37,15 @@ None of this uses keyword matching or a fixed intent enum. **Every** decision �
 
 | Module | Role |
 |---|---|
+| `main.py` | `handle_inbound` (the entry point for every MQTT message) and process startup/shutdown (`_run`) — everything else has moved out to keep this small |
+| `runtime.py` | The module-level MQTT/internal-API clients, `PAUSE_TOOL_NAMES`, and `run_agent_loop`/`resume_agent_loop` — the one leaf module `main.py`/`pauses.py`/`callbacks.py` all import from, so none of the three needs to import either of the other two |
+| `pauses.py` | Everything about pausing the agent loop on a tool call and resuming it later — the `kick_off_*` dispatch for each async tool and the Human-in-the-Loop confirmation, plus `finish_paused_turn`, the shared tail end every resume path funnels through |
+| `callbacks.py` | The internal HTTP API each worker calls back to (`handle_doc_ingestion_result`/`handle_doc_generation_result`/`handle_image_generation_result`) and `build_app` |
 | `llm.py` | Instantiates the one `GeminiClient` this service uses, and holds `SYSTEM_PROMPT` — all the conversational behavior lives here, as a prompt, not as code branches |
 | `actions.py` | The tool schemas Gemini sees, and the plain function dispatcher that executes them against PostgREST (`registry.py`) — no judgment, it runs whatever it's told |
 | `security_guard.py` | The Human-in-the-Loop gate: builds the approval prompt/buttons, parses a yes/no reply, and is the one place a write tool actually reaches `actions.dispatch()` |
 | `registry.py` | PostgREST read/write surface for `home.device`/`device_document` — what `actions.py`'s handlers call into |
-| `conversation.py` | `home.conversation` CRUD (get-or-create by channel, state patch) |
+| `conversation.py` | `home.conversation` CRUD (get-or-create by channel, optimistic-concurrency-guarded state patch) |
 | `messaging.py` | Publishes replies to `home/outbound/<channel>/<user_id>` |
 
 ### The tools (`actions.py`)

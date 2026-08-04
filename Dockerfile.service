@@ -12,7 +12,15 @@ COPY shared ./shared
 
 ARG SERVICE
 COPY ${SERVICE} ./${SERVICE}
-RUN uv sync --package ${SERVICE} --frozen --no-dev || uv sync --package ${SERVICE} --no-dev
+RUN uv sync --package ${SERVICE} --frozen --no-dev
+
+# Run as a non-root user — chown after `uv sync` (which needs to run as root
+# to write the shared /app venv/cache), so the resulting .venv is still
+# readable/executable by appuser.
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 WORKDIR /app/${SERVICE}
 
 ARG MODULE

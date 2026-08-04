@@ -212,11 +212,28 @@ A few decisions worth knowing about before you start reading code:
 - **An image request checks for one already on file before searching or generating a new one.** `generate_image`, given a `device_id`, first checks that device's attached documents (`home.device_document`, kind `photo`) and reuses one if it's still fetchable — only then does it fall through to `image-generation-worker` (a real Google Custom Search image lookup first, Gemini generation as the fallback). Either way the result is always a real JPEG, delivered via Telegram's `sendPhoto` (an inline preview, not a generic downloadable file — `AttachmentKind.IMAGE` vs. `AttachmentKind.DOCUMENT` on the `Attachment`).
 - **Human-in-the-Loop approval gates every write.** `create_device`/`update_device`/`retire_device` pause the agent loop the same way the async vision-extraction/document-generation tools do, but instead of doing background work, `orchestrator` asks the user to approve or reject via the channel (Telegram inline buttons, or a plain sí/no reply elsewhere — see [`orchestrator/orchestrator/security_guard.py`](./orchestrator/orchestrator/security_guard.py)) before the call ever reaches PostgREST. Read-only tools (`list_devices`, `get_device`, `get_compatible_devices`) and the purely-additive `attach_document` execute immediately — no approval needed.
 - **Conversation state is the Gemini transcript itself.** `conversation.state.history` is the literal list of messages replayed each turn — quiz progress, corrections mid-onboarding, which device a "yes" refers to are all just Gemini re-reading its own prior turns, not a hand-rolled state machine. Only one tool call is resolved per pause/resume round trip (see the multi-attachment note above) — no other tool in that batch runs, so a side-effecting call never executes only to be discarded.
+- **Every conversation-state write is guarded against a concurrent one clobbering it.** `orchestrator/orchestrator/conversation.py::update_state` takes a `mutate(state) -> state` function, not a state dict built once from a snapshot — it applies `mutate` and writes with an `updated_at=eq.<last seen>` filter, retrying once against a freshly re-read row if another writer (a worker callback racing a fresh inbound message, or two callbacks) got there first. Two real incidents this project hit (a callback racing ahead of its own `pending_agent_turn` write) were specific cases of this general lost-update race — this closes the class, not just those two instances.
 - **Descriptive while working, concise once it answers.** `telegram-adapter` shows Telegram's native "escribiendo..." indicator for as long as a turn is in flight, and `SYSTEM_PROMPT` (`orchestrator/orchestrator/llm.py`) asks Gemini for a one-sentence heads-up before any tool call that takes a moment — but the same prompt also asks it to keep the actual answer itself short and to the point, no preambles or wrap-up summaries.
 - **No custom CRUD service.** Device/user/conversation data is served straight off Postgres by PostgREST — see [`db/schema.sql`](./db/schema.sql) for the schema and the `compatible_devices()` SQL function that powers the compatibility graph.
 - **Nothing crashes on a connection hiccup.** Every service retries MQTT connections and missing credentials in a loop (with a configurable backoff) instead of exiting — see `shared/shared/mqtt_client.py` and `shared/shared/settings.py`.
 - **`appconfig.json` hot-reloads, secrets don't.** Matches how Barbara's own connectors are configured — see any service's README for the exact split.
 - **Single-tenant, single-household, no auth.** PostgREST runs a single service role with no JWT, and `web-adapter` has no login — this is a deliberate simplicity choice for a trusted home LAN, documented inline where it matters (and easy to revisit if this ever needs to serve more than one household).
+
+## Operational runbook
+
+There's no automated alerting for a conversation stuck mid-turn (waiting on a worker callback that already happened and was dropped, or one that genuinely never arrives) — the two real incidents that class of bug caused were both found by the household noticing the bot kept replying "Sigo con lo anterior..." A quick way to check for one directly against Postgres (or via PostgREST):
+
+```sql
+-- Conversations that have been "pending" for more than 10 minutes — worth
+-- investigating (check the corresponding worker's logs for a dropped
+-- callback) rather than assuming the household will always notice and report it.
+SELECT id, channel, channel_conversation_id, state->>'pending_agent_turn' AS pending_tool_use_id, updated_at
+FROM home.conversation
+WHERE state ? 'pending_agent_turn'
+  AND updated_at < now() - interval '10 minutes';
+```
+
+If one shows up stuck, clearing it directly (drop `pending_agent_turn`/`pending_attachments`/`pending_device_id`/`pending_confirmation` from `state`) unblocks the conversation — but consider appending a synthetic `function_response` to `state->'history'` for whatever tool call is still dangling first (matching what `pauses.py::finish_paused_turn` would have written), so Gemini doesn't see an unresolved tool call and confabulate a result for it on the next unrelated message.
 
 ## License
 

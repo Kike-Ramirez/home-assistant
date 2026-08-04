@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS home.device (
     brand               text,
     model               text,
     attributes          jsonb NOT NULL DEFAULT '{}'::jsonb, -- free-form specs (voltage, capacity, ...)
-    status              text NOT NULL DEFAULT 'active',     -- active | retired
+    status              text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
     owner_user_id       uuid,               -- FK added after creating home.app_user
 
     created_at          timestamptz NOT NULL DEFAULT now(),
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS home.device_document (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id   text NOT NULL DEFAULT 'home',
     device_id   uuid REFERENCES home.device(id) ON DELETE CASCADE,
-    kind        text NOT NULL,      -- 'photo' | 'manual' | 'note' | 'report'
+    kind        text NOT NULL CHECK (kind IN ('photo', 'manual', 'note', 'report')),
     url_or_ref  text NOT NULL,      -- public URL, data: URI, or a Files API reference
     media_type  text,               -- MIME type, e.g. 'image/jpeg', 'application/pdf' — best-effort, not always known
     description text,
@@ -155,6 +155,25 @@ CREATE INDEX IF NOT EXISTS idx_device_document_device ON home.device_document (d
 -- fk_device_owner below, added the same way after the fact).
 ALTER TABLE home.device_document ALTER COLUMN device_id DROP NOT NULL;
 ALTER TABLE home.device_document ADD COLUMN IF NOT EXISTS media_type text;
+
+-- Enum-shaped text columns (documented as such in comments, never enforced)
+-- now have a real CHECK behind them — cheap insurance now that more than
+-- just Gemini-tool-schema-validated code paths write these columns (e.g.
+-- `main.py`'s automatic device_document persistence writes `kind` directly).
+-- DO $$ blocks below because "ADD CONSTRAINT IF NOT EXISTS" isn't valid
+-- syntax for CHECK constraints — this makes re-running the file idempotent
+-- the same way IF NOT EXISTS does elsewhere.
+DO $$ BEGIN
+    ALTER TABLE home.device_document ADD CONSTRAINT device_document_kind_check
+        CHECK (kind IN ('photo', 'manual', 'note', 'report'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+    ALTER TABLE home.device ADD CONSTRAINT device_status_check
+        CHECK (status IN ('active', 'retired'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 -- =============================================================================
 -- 5. Users (role + scope, even though there's only one today)
@@ -186,11 +205,17 @@ CREATE TABLE IF NOT EXISTS home.conversation (
     user_id             uuid REFERENCES home.app_user(id),
     intent              text,                -- 'device_onboarding' | 'troubleshooting' | 'course' | 'replacement'
     state               jsonb NOT NULL DEFAULT '{}'::jsonb, -- session context, quiz answers, etc.
-    status              text NOT NULL DEFAULT 'open', -- open | closed
+    status              text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
     created_at          timestamptz NOT NULL DEFAULT now(),
     updated_at          timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant_id, channel, channel_conversation_id)
 );
+
+DO $$ BEGIN
+    ALTER TABLE home.conversation ADD CONSTRAINT conversation_status_check
+        CHECK (status IN ('open', 'closed'));
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
 CREATE TABLE IF NOT EXISTS home.message (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),

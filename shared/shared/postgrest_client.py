@@ -62,6 +62,18 @@ class PostgrestClient:
         resp = await query.execute()
         return resp.data[0]
 
+    async def patch_if_match(self, table: str, params: dict[str, Any], payload: dict[str, Any]) -> dict | None:
+        """Same as `patch()`, but returns `None` instead of raising when the
+        filter matches zero rows, rather than assuming exactly one row always
+        matches. For optimistic-concurrency callers (e.g.
+        `conversation.py::update_state`) that add an `updated_at=eq....`
+        filter alongside the row id — a `None` here means someone else's
+        write landed first, not a real error."""
+        query = self._client.from_(table).update(payload)
+        query = self._apply_filters(query, params)
+        resp = await query.execute()
+        return resp.data[0] if resp.data else None
+
     async def rpc(self, function_name: str, payload: dict[str, Any]) -> Any:
         resp = await self._client.rpc(function_name, payload).execute()
         return resp.data
