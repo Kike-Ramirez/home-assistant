@@ -77,6 +77,13 @@ class ManagedMqttConnection:
         self._client: aiomqtt.Client | None = None
         self._logger = logging.getLogger(logger_name)
 
+    def bind(self, client: aiomqtt.Client) -> None:
+        """Makes `client` available to `publish()` right away, before
+        `consume()` (which sets the same thing) starts blocking on
+        subscribe/messages — for anything that needs to publish once on
+        connect, before subscribing to anything (e.g. a startup message)."""
+        self._client = client
+
     async def publish(self, topic: str, payload: str, qos: int = 1) -> None:
         if self._client is None:
             self._logger.warning("MQTT isn't available right now — message to %s dropped", topic)
@@ -102,6 +109,10 @@ class ManagedMqttConnection:
                 try:
                     await handle_message(message)
                 except Exception:
-                    self._logger.exception("Error processing message from %s", message.topic)
+                    self._logger.exception(
+                        "Error processing message from %s — see the traceback above, usually a "
+                        "PostgREST/Gemini/internal-API failure. The message is dropped, not retried.",
+                        message.topic,
+                    )
         finally:
             self._client = None

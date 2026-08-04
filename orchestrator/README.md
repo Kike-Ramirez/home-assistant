@@ -69,13 +69,14 @@ Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecret
 |---|---|---|
 | `GEMINI_API_KEY` | yes | Your Google Gemini API key — see below |
 | `POSTGREST_URL` | yes | Base URL of the PostgREST instance, e.g. `http://postgrest:3000` |
-| `DOC_INGESTION_WORKER_URL` | yes | Base URL of `doc-ingestion-worker`'s internal API, e.g. `http://doc-ingestion-worker:8080` |
-| `DOC_GENERATION_WORKER_URL` | yes | Base URL of `doc-generation-worker`'s internal API, e.g. `http://doc-generation-worker:8080` |
+| `DOC_INGESTION_WORKER_URL` | no (default `http://doc-ingestion-worker:8080`) | Base URL of `doc-ingestion-worker`'s internal API — the default is the fixed docker-compose service hostname/port, only override for a non-standard deployment |
+| `DOC_GENERATION_WORKER_URL` | no (default `http://doc-generation-worker:8080`) | Base URL of `doc-generation-worker`'s internal API — the default is the fixed docker-compose service hostname/port, only override for a non-standard deployment |
 | `MQTT_HOST` | yes | MQTT broker hostname |
 | `MQTT_PORT` | no (default `8883`) | MQTT broker port |
 | `MQTT_USER` | yes | MQTT username |
 | `MQTT_PASSWORD` | yes | MQTT password |
 | `MQTT_TLS_ENABLED` | no (default `true`) | Whether to use TLS for the MQTT connection |
+| `TELEGRAM_ADMIN_CHAT_ID` | no (default: skipped) | Your Telegram chat id — if set, orchestrator sends a friendly one-time "I'm up" welcome message here right after startup |
 
 If any required variable is missing, the service logs an error naming it exactly and keeps retrying instead of crashing.
 

@@ -77,9 +77,18 @@ async def _attachment_part(attachment: Attachment, http_client: httpx.AsyncClien
         response = await http_client.get(attachment.url_or_data)
         response.raise_for_status()
         data = response.content
+        # Trust the attachment's own media_type first — a channel adapter (e.g.
+        # telegram-adapter) already knows the real kind of what it forwarded,
+        # while the source server's content-type can be a useless generic
+        # value (Telegram's file-download endpoint returns
+        # application/octet-stream for photos, which Gemini's vision API rejects).
         media_type = attachment.media_type or response.headers.get("content-type", default_mime).split(";")[0]
 
-    return {"inline_data": {"mime_type": media_type, "data": data}}
+    # base64 text, not raw bytes — same reasoning as thought_signature below:
+    # this part ends up in `conversation.state.history`, persisted as JSON via
+    # PostgREST, which can't encode a bytes value. Decoded back before it's
+    # actually sent to the API (see _decode_for_api).
+    return {"inline_data": {"mime_type": media_type, "data": base64.b64encode(data).decode("ascii")}}
 
 
 async def _attachment_parts(attachments: list[Attachment], http_client: httpx.AsyncClient | None) -> list[dict[str, Any]]:
@@ -141,15 +150,19 @@ def _model_parts_from_response(response: Any) -> list[dict[str, Any]]:
     return parts
 
 
-def _decode_thought_signatures(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Reverses `_model_parts_from_response`'s base64 encoding right before a
-    request goes out — the API wants the raw bytes back, not the JSON-safe text."""
+def _decode_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Reverses `_model_parts_from_response`'s `thought_signature` encoding and
+    `_attachment_part`'s `inline_data` encoding right before a request goes
+    out — the API wants raw bytes back for both, not the JSON-safe base64 text
+    kept in `conversation.state.history`."""
     decoded = []
     for message in messages:
         parts = []
         for part in message.get("parts", []):
             if isinstance(part, dict) and isinstance(part.get("thought_signature"), str):
                 part = {**part, "thought_signature": base64.b64decode(part["thought_signature"])}
+            if isinstance(part, dict) and isinstance(part.get("inline_data"), dict) and isinstance(part["inline_data"].get("data"), str):
+                part = {**part, "inline_data": {**part["inline_data"], "data": base64.b64decode(part["inline_data"]["data"])}}
             parts.append(part)
         decoded.append({**message, "parts": parts})
     return decoded
@@ -187,17 +200,35 @@ class GeminiClient:
             parts.append({"text": text})
         return {"role": "user", "parts": parts or [{"text": ""}]}
 
-    def find_tool_use(self, messages: list[dict[str, Any]], name: str | None = None) -> dict[str, Any] | None:
+    def find_tool_use(
+        self, messages: list[dict[str, Any]], name: str | None = None, names: frozenset[str] | None = None
+    ) -> dict[str, Any] | None:
+        """Finds a function_call in the last turn's parts.
+
+        `name` matches one specific tool. `names`, used by `main.py` to locate
+        the pausing call, matters when a batch mixes an immediate tool (e.g.
+        `attach_document`) with a pausing one (e.g. `create_device`) — the
+        immediate one can come first in `parts`, so a plain "first function_call"
+        search would return the wrong one. When `names` is given, a call whose
+        name is in it wins even if it isn't first; otherwise falls back to the
+        first function_call found, same as before.
+        """
         if not messages:
             return None
         parts = messages[-1].get("parts")
         if not isinstance(parts, list):
             return None
+        fallback: dict[str, Any] | None = None
         for part in parts:
             fc = part.get("function_call") if isinstance(part, dict) else None
-            if fc and (name is None or fc.get("name") == name):
-                return {"id": fc.get("id"), "name": fc["name"], "input": fc.get("args") or {}}
-        return None
+            if not fc or (name is not None and fc.get("name") != name):
+                continue
+            tool_use = {"id": fc.get("id"), "name": fc["name"], "input": fc.get("args") or {}}
+            if names is None or fc.get("name") in names:
+                return tool_use
+            if fallback is None:
+                fallback = tool_use
+        return fallback
 
     def _config(self, system: str, tools: list[dict[str, Any]], max_tokens: int, web_search: bool) -> types.GenerateContentConfig:
         gemini_tools = _tool_declarations(tools)
@@ -235,7 +266,7 @@ class GeminiClient:
         for _ in range(max_iterations):
             try:
                 response = await self._client.aio.models.generate_content(
-                    model=self._model_name, contents=_decode_thought_signatures(working), config=config
+                    model=self._model_name, contents=_decode_for_api(working), config=config
                 )
             except genai_errors.APIError as exc:
                 # Covers quota/rate-limit errors (429 RESOURCE_EXHAUSTED) and any other
@@ -370,7 +401,7 @@ class GeminiClient:
         contents: list[dict[str, Any]] = [{"role": "user", "parts": parts}]
         last_error: Exception | None = None
         for _ in range(max_retries + 1):
-            response = await self._client.aio.models.generate_content(model=self._model_name, contents=contents, config=config)
+            response = await self._client.aio.models.generate_content(model=self._model_name, contents=_decode_for_api(contents), config=config)
             try:
                 data = json.loads(response.text or "")
                 return model.model_validate(data)

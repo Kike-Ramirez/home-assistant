@@ -52,7 +52,10 @@ async def _process(request: DocGenerationRequest) -> None:
                     data_base64=base64.b64encode(data).decode("ascii"),
                 )
             except Exception as exc:  # noqa: BLE001 — any failure needs to be reported back to the user
-                logger.exception("Error rendering a document")
+                logger.exception(
+                    "Error rendering a document — common cause: unexpected file_type/content in "
+                    "request.content — see render() in render.py for the exact format it expects."
+                )
                 result = DocGenerationResult(
                     conversation_id=request.conversation_id,
                     channel_conversation_id=request.channel_conversation_id,
@@ -89,7 +92,7 @@ async def _on_config_change(changed_keys: set[str]) -> None:
 
 
 async def on_startup(app: web.Application) -> None:
-    logger.info("doc-generation-worker starting up (max concurrency: %s)", _max_concurrency)
+    logger.info("doc-generation-worker ready (max concurrency: %s).", _max_concurrency)
     app["config_task"] = asyncio.create_task(
         watch_appconfig(SERVICE_NAME, system, appconfig, on_change=_on_config_change)
     )

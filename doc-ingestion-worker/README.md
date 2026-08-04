@@ -25,7 +25,7 @@ Fill in these variables in the repo-root [`barbarasecrets.env`](../barbarasecret
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | yes | Your Google Gemini API key — see the note below |
-| `ORCHESTRATOR_URL` | yes | Base URL of `orchestrator`'s internal API, e.g. `http://orchestrator:8080` |
+| `ORCHESTRATOR_URL` | no (default `http://orchestrator:8080`) | Base URL of `orchestrator`'s internal API — the default is the fixed docker-compose service hostname/port, only override for a non-standard deployment |
 
 No `MQTT_*` or `POSTGREST_URL` needed — see above, this service has no MQTT or Postgres connection of its own.
 

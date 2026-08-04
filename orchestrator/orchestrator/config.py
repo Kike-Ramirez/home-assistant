@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from shared.settings import (
     DocGenerationWorkerSecrets,
     DocIngestionWorkerSecrets,
@@ -21,3 +22,19 @@ postgrest_secrets = load_secrets(PostgrestSecrets, SERVICE_NAME, system.connect_
 # to know where to find either of them.
 doc_ingestion_worker_secrets = load_secrets(DocIngestionWorkerSecrets, SERVICE_NAME, system.connect_timeout_seconds)
 doc_generation_worker_secrets = load_secrets(DocGenerationWorkerSecrets, SERVICE_NAME, system.connect_timeout_seconds)
+
+
+class WelcomeSecrets(BaseSettings):
+    """The household's own Telegram chat id, so orchestrator can greet them
+    proactively on startup — not a per-request secret, and optional: with it
+    unset the welcome message is simply skipped (logged once), everything
+    else works exactly the same."""
+
+    model_config = SettingsConfigDict(env_prefix="TELEGRAM_", extra="ignore")
+
+    admin_chat_id: str = ""
+
+
+# Not run through load_secrets (which retries forever on a missing value) —
+# this one is optional by design, so a plain one-shot read is enough.
+welcome_secrets = WelcomeSecrets()

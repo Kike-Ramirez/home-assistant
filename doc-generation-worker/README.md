@@ -23,7 +23,7 @@ Like every service here, this reads its config from the **shared** files at the 
 
 | Variable | Required | Description |
 |---|---|---|
-| `ORCHESTRATOR_URL` | yes | Base URL of `orchestrator`'s internal API, e.g. `http://orchestrator:8080` |
+| `ORCHESTRATOR_URL` | no (default `http://orchestrator:8080`) | Base URL of `orchestrator`'s internal API — the default is the fixed docker-compose service hostname/port, only override for a non-standard deployment |
 
 No `MQTT_*`, `POSTGREST_URL`, or `GEMINI_API_KEY` needed — this service has no MQTT/Postgres/LLM connection of its own.
 

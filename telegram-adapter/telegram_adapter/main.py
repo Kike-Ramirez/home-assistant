@@ -18,6 +18,8 @@ import logging
 
 import httpx
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -33,6 +35,7 @@ from shared.mqtt_client import ManagedMqttConnection, maintain_mqtt_connection
 from shared.settings import watch_appconfig
 
 from .config import SERVICE_NAME, appconfig, mqtt_secrets, system, telegram_secrets
+from .formatting import markdown_to_telegram_html
 
 logger = logging.getLogger("telegram_adapter")
 
@@ -44,7 +47,11 @@ CHANNEL = "telegram"
 # album as its own separate Update, not as a single message.
 ALBUM_DEBOUNCE_SECONDS = 1.5
 
-bot = Bot(token=telegram_secrets.bot_token)
+# HTML as the default parse_mode: Gemini's replies use a light Markdown
+# subset (see SYSTEM_PROMPT), converted to Telegram-safe HTML by
+# markdown_to_telegram_html() before every send_message call — HTML needs far
+# less escaping than Telegram's own MarkdownV2 for arbitrary model output.
+bot = Bot(token=telegram_secrets.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # Persistent MQTT connection for the life of the process, reused for both
@@ -237,9 +244,17 @@ async def _handle_outbound_message(mqtt_message) -> None:
     reply_markup = _build_reply_markup(msg)
 
     if msg.content:
-        await bot.send_message(chat_id=chat_id, text=msg.content, reply_markup=reply_markup)
+        await bot.send_message(chat_id=chat_id, text=markdown_to_telegram_html(msg.content), reply_markup=reply_markup)
+    elif reply_markup is not None:
+        # No text, but there are buttons (Aprobar/Rechazar) to show — Telegram
+        # rejects an empty-text sendMessage outright, so this needs *some* text.
+        await bot.send_message(chat_id=chat_id, text="…", reply_markup=reply_markup)
     elif not msg.attachments:
-        await bot.send_message(chat_id=chat_id, text="", reply_markup=reply_markup)
+        # No text, no buttons, no attachments — nothing to actually send.
+        # orchestrator is expected to never produce this (see DEFAULT_DONE_FALLBACK
+        # in orchestrator/llm.py), but silently dropping here is still safer than
+        # calling Telegram's API with an empty string, which it rejects outright.
+        logger.warning("Outbound message for user %s has no content, actions, or attachments — dropping", msg.user_id)
 
     for attachment in msg.attachments:
         data = await _attachment_bytes(attachment)
@@ -248,17 +263,19 @@ async def _handle_outbound_message(mqtt_message) -> None:
 
 
 async def main() -> None:
-    logger.info("telegram-adapter starting up (long polling)")
+    _ready_logged = False
+
+    async def on_mqtt_connect(client) -> None:
+        nonlocal _ready_logged
+        if not _ready_logged:
+            _ready_logged = True
+            logger.info("telegram-adapter ready: connected to Telegram (long polling) and MQTT.")
+        await _mqtt.consume(client, outbound_topic(CHANNEL, "+"), _handle_outbound_message)
+
     # Telegram polling and the MQTT connection have independent lifecycles:
     # if MQTT drops, it reconnects on its own (with backoff) without
     # affecting Telegram message reception.
-    mqtt_task = asyncio.create_task(
-        maintain_mqtt_connection(
-            mqtt_secrets,
-            system,
-            lambda client: _mqtt.consume(client, outbound_topic(CHANNEL, "+"), _handle_outbound_message),
-        )
-    )
+    mqtt_task = asyncio.create_task(maintain_mqtt_connection(mqtt_secrets, system, on_mqtt_connect))
     config_task = asyncio.create_task(watch_appconfig(SERVICE_NAME, system, appconfig))
     try:
         await dp.start_polling(bot)

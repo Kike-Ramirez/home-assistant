@@ -72,6 +72,28 @@ APPCONFIG_RELOAD_SECONDS = 10.0
 
 _MISSING = object()
 
+# Third-party libraries that log one line per request/update at INFO by
+# default — with our own code logging almost nothing at INFO (by design, see
+# `bootstrap_service`), these used to be ~90% of everything in the logs
+# (httpx alone logging every single PostgREST/Gemini/Telegram HTTP call).
+# Quieted to WARNING unless `debugLevel: "debug"` is set, in which case
+# they're exactly the kind of low-level detail worth turning back on.
+_DEBUG_ONLY_LOGGERS = ("httpx", "httpcore", "aiohttp.access", "aiogram.event", "aiogram.dispatcher")
+
+# google-genai logs this WARNING on every single call, purely because we
+# drive tool-calling ourselves instead of using its automatic function
+# calling (AFC) — expected and never actionable, so it's silenced regardless
+# of debugLevel.
+_ALWAYS_QUIET_LOGGERS = ("google_genai.models", "google_genai.types")
+
+
+def _tune_third_party_loggers(debug_level: DebugLevel) -> None:
+    for name in _ALWAYS_QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
+    level = logging.INFO if debug_level == "debug" else logging.WARNING
+    for name in _DEBUG_ONLY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
 SecretsT = TypeVar("SecretsT", bound=BaseSettings)
 
 
@@ -99,28 +121,44 @@ class GeminiSecrets(BaseSettings):
 
 class OrchestratorSecrets(BaseSettings):
     """Where to reach orchestrator's internal API — used by doc-ingestion-worker
-    to deliver extraction results. Not sensitive, but kept alongside the other
-    connection secrets for consistency (same pattern as POSTGREST_URL)."""
+    and doc-generation-worker to deliver their results.
+
+    Not a real secret and not environment-specific: both docker-compose files
+    put every service on the same `barbaraServices` network, so `orchestrator`
+    always resolves via Docker's internal DNS to the container declared under
+    that exact name, on the fixed internal port from appconfig.json (see
+    CLAUDE.md section 10). The default below is that fixed value — this only
+    needs an env var at all in case something unusual (a renamed service, a
+    non-Docker-Compose deployment) ever needs to override it.
+    """
 
     model_config = SettingsConfigDict(env_prefix="ORCHESTRATOR_", extra="ignore")
 
-    url: str
+    url: str = "http://orchestrator:8080"
 
 
 class DocIngestionWorkerSecrets(BaseSettings):
-    """Where orchestrator reaches doc-ingestion-worker to fire an extraction job."""
+    """Where orchestrator reaches doc-ingestion-worker to fire an extraction job.
+
+    Same reasoning as `OrchestratorSecrets` above — a fixed internal
+    Docker Compose hostname/port, not a per-deployment secret.
+    """
 
     model_config = SettingsConfigDict(env_prefix="DOC_INGESTION_WORKER_", extra="ignore")
 
-    url: str
+    url: str = "http://doc-ingestion-worker:8080"
 
 
 class DocGenerationWorkerSecrets(BaseSettings):
-    """Where orchestrator reaches doc-generation-worker to fire a document-rendering job."""
+    """Where orchestrator reaches doc-generation-worker to fire a document-rendering job.
+
+    Same reasoning as `OrchestratorSecrets` above — a fixed internal
+    Docker Compose hostname/port, not a per-deployment secret.
+    """
 
     model_config = SettingsConfigDict(env_prefix="DOC_GENERATION_WORKER_", extra="ignore")
 
-    url: str
+    url: str = "http://doc-generation-worker:8080"
 
 
 class SystemConfig(BaseModel):
@@ -266,7 +304,8 @@ def bootstrap_service(
     right after calling this.
     """
     system, appconfig = load_service_config(service_name, path)
-    logging.basicConfig(level=system.log_level)
+    logging.basicConfig(level=system.log_level, format="%(levelname)s %(name)s: %(message)s")
+    _tune_third_party_loggers(system.debug_level)
     return system, appconfig
 
 
@@ -308,6 +347,7 @@ async def watch_appconfig(
             )
             system.debug_level = new_system.debug_level
             logging.getLogger().setLevel(system.log_level)
+            _tune_third_party_loggers(system.debug_level)
             system_changed = True
 
         if new_system.connect_timeout_ms != system.connect_timeout_ms:

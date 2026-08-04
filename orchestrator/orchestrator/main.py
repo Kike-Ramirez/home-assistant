@@ -73,6 +73,7 @@ from .config import (
     mqtt_secrets,
     postgrest_secrets,
     system,
+    welcome_secrets,
 )
 from .conversation import clear_keys, get_conversation_by_id, get_or_create_conversation, update_state
 from .messaging import reply, reply_raw
@@ -84,6 +85,19 @@ _doc_ingestion_client = InternalApiClient(doc_ingestion_worker_secrets.url, "orc
 _doc_generation_client = InternalApiClient(doc_generation_worker_secrets.url, "orchestrator")
 
 _PAUSE_TOOL_NAMES = actions.ASYNC_TOOL_NAMES | actions.CONFIRM_TOOL_NAMES
+
+# Sent once, the first time MQTT connects after startup (see _run) — a fixed
+# string, not Claude-generated, so it doesn't depend on Gemini being reachable
+# yet at boot and doesn't cost a call for something said the same way every time.
+WELCOME_MESSAGE = (
+    "¡Hola! 👋 Soy tu asistente para los aparatos de casa, ya listo para ayudarte.\n\n"
+    "Puedo:\n"
+    "• Dar de alta un dispositivo nuevo — mándame una foto de la etiqueta o el manual.\n"
+    "• Ayudarte a resolver una avería o duda técnica de algo que ya tienes.\n"
+    "• Prepararte un mini-curso (con quiz) sobre lo que quieras aprender.\n"
+    "• Recomendarte un recambio o una compra nueva compatible con lo que ya tienes en casa.\n\n"
+    "Cuéntame qué necesitas cuando quieras. 🙂"
+)
 
 
 def _loop_kwargs() -> dict[str, Any]:
@@ -148,12 +162,17 @@ async def handle_inbound(pg: PostgrestClient, mqtt: ManagedMqttConnection, paylo
 
     if result.done:
         await update_state(pg, conversation["id"], {**state, "history": result.messages})
-        await reply(mqtt, msg, result.final_text or "")
+        await reply(mqtt, msg, result.final_text or llm.DEFAULT_DONE_FALLBACK)
         return
 
-    tool_use = llm.client.find_tool_use(result.messages)
+    tool_use = llm.client.find_tool_use(result.messages, names=_PAUSE_TOOL_NAMES)
     if tool_use is None:
-        logger.error("Agent loop paused with no pending tool_use — conversation %s", conversation["id"])
+        logger.error(
+            "Agent loop paused with no pending tool_use — conversation %s. Likely cause: run_agent_loop "
+            "returned done=False without a function_call in the last part — check GeminiClient._loop in "
+            "shared/shared/gemini_client.py.",
+            conversation["id"],
+        )
         await update_state(pg, conversation["id"], {**state, "history": result.messages})
         await reply(mqtt, msg, "Algo ha ido mal — inténtalo de nuevo.")
         return
@@ -186,7 +205,13 @@ async def _kick_off_pending_tool(
     elif name in actions.CONFIRM_TOOL_NAMES:
         await _kick_off_confirmation(pg, mqtt, conversation, channel, user_id, channel_conversation_id, attachments, result, tool_use)
     else:
-        logger.error("Agent loop paused on unexpected tool %r — conversation %s", name, conversation["id"])
+        logger.error(
+            "Agent loop paused on unexpected tool %r — conversation %s. Likely cause: this tool isn't in "
+            "ASYNC_TOOL_NAMES/CONFIRM_TOOL_NAMES (actions.py) but the model is treating it as pausable — "
+            "add it to one of those two sets if that's intentional.",
+            name,
+            conversation["id"],
+        )
         await update_state(pg, conversation["id"], {**conversation["state"], "history": result.messages})
         await reply_raw(mqtt, channel, user_id, channel_conversation_id, "Algo ha ido mal — inténtalo de nuevo.")
 
@@ -346,7 +371,7 @@ async def _finish_paused_turn(
         )
 
     if not agent_result.done:
-        tool_use = llm.client.find_tool_use(agent_result.messages)
+        tool_use = llm.client.find_tool_use(agent_result.messages, names=_PAUSE_TOOL_NAMES)
         if tool_use is not None and tool_use["name"] in _PAUSE_TOOL_NAMES:
             # The model asked for another paused tool in the same resumed turn
             # (e.g. the next photo in a multi-attachment message) — keep the
@@ -378,7 +403,7 @@ async def _finish_paused_turn(
     )
     await update_state(pg, conversation["id"], new_state)
     if attachment is None:
-        await reply_raw(mqtt, channel, user_id, channel_conversation_id, agent_result.final_text or "")
+        await reply_raw(mqtt, channel, user_id, channel_conversation_id, agent_result.final_text or llm.DEFAULT_DONE_FALLBACK)
 
 
 # --- Internal HTTP API (doc-ingestion-worker, doc-generation-worker) -------
@@ -456,11 +481,29 @@ def build_app(pg: PostgrestClient) -> web.Application:
     return app
 
 
+async def _send_welcome_message() -> None:
+    if not welcome_secrets.admin_chat_id:
+        logger.warning(
+            "TELEGRAM_ADMIN_CHAT_ID isn't set — skipping the startup welcome message. Suggested fix: add "
+            "that variable to barbarasecrets.env with your own Telegram chat id."
+        )
+        return
+    await reply_raw(_mqtt, "telegram", welcome_secrets.admin_chat_id, welcome_secrets.admin_chat_id, WELCOME_MESSAGE)
+
+
 async def _run() -> None:
-    logger.info("orchestrator starting up (PostgREST: %s, engine: gemini)", postgrest_secrets.url)
     pg = PostgrestClient(postgrest_secrets.url)
+    _ready_logged = False
+    _http_ready = asyncio.Event()
 
     async def on_mqtt_connect(client) -> None:
+        nonlocal _ready_logged
+        _mqtt.bind(client)
+        if not _ready_logged:
+            _ready_logged = True
+            await _http_ready.wait()  # so "ready" is only logged once BOTH MQTT and the internal API are up
+            logger.info("orchestrator ready: MQTT connected, PostgREST reachable, Gemini engine configured.")
+            await _send_welcome_message()
         await _mqtt.consume(client, "home/inbound/+/+", lambda message: handle_inbound(pg, _mqtt, message.payload))
 
     mqtt_task = asyncio.create_task(maintain_mqtt_connection(mqtt_secrets, system, on_mqtt_connect))
@@ -471,7 +514,7 @@ async def _run() -> None:
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=appconfig.get("port", 8080))
     await site.start()
-    logger.info("orchestrator internal API listening on :%s", appconfig.get("port", 8080))
+    _http_ready.set()
 
     try:
         await asyncio.Event().wait()  # keeps the process alive

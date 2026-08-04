@@ -53,7 +53,19 @@ class InternalApiClient:
                         "Call to %s failed (%s) — retrying in %.1fs", path, exc, self._retry_delay_seconds
                     )
                     await asyncio.sleep(self._retry_delay_seconds)
-        self._logger.error("Call to %s failed after %d attempts: %s", path, self._max_retries + 1, last_exc)
+        hint = (
+            "the service doesn't resolve over DNS — its container is likely not deployed, or the "
+            "configured URL doesn't match its docker-compose service name"
+            if isinstance(last_exc, httpx.ConnectError)
+            else "check that the service is up and healthy (docker compose ps / logs)"
+        )
+        self._logger.error(
+            "Call to %s failed after %d attempts: %s — suggested fix: %s.",
+            path,
+            self._max_retries + 1,
+            last_exc,
+            hint,
+        )
         return None
 
     async def aclose(self) -> None:

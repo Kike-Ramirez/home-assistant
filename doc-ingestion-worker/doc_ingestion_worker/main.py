@@ -48,7 +48,10 @@ async def _process(request: DocIngestionRequest) -> None:
                     draft_device=draft,
                 )
             except Exception as exc:  # noqa: BLE001 — any failure needs to be reported back to the user
-                logger.exception("Error extracting device data")
+                logger.exception(
+                    "Error extracting device data — common causes: attachment media_type unsupported by "
+                    "Gemini, GEMINI_API_KEY quota/rate-limit exhausted, or the attachment isn't reachable."
+                )
                 result = DocIngestionResult(
                     conversation_id=request.conversation_id,
                     channel_conversation_id=request.channel_conversation_id,
@@ -90,7 +93,7 @@ async def _on_config_change(changed_keys: set[str]) -> None:
 
 
 async def on_startup(app: web.Application) -> None:
-    logger.info("doc-ingestion-worker starting up (max concurrency: %s)", _max_concurrency)
+    logger.info("doc-ingestion-worker ready (max concurrency: %s).", _max_concurrency)
     app["config_task"] = asyncio.create_task(
         watch_appconfig(SERVICE_NAME, system, appconfig, on_change=_on_config_change)
     )

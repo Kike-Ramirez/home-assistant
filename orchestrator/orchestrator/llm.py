@@ -46,6 +46,13 @@ API_ERROR_FALLBACK = (
     "Puede que se haya agotado la cuota o haya un problema temporal; prueba de nuevo en unos minutos."
 )
 
+# Used whenever the model finishes a turn (or a resumed one) with an empty
+# `final_text` — common right after a tool result, when Gemini considers the
+# function_response self-explanatory and writes nothing. Without this, the
+# household would get no confirmation at all that an action actually finished
+# (and, on Telegram, an outright empty message would be rejected by the API).
+DEFAULT_DONE_FALLBACK = "Hecho."
+
 # =============================================================================
 # The agent loop's system prompt (used by main.py via client.run_agent_loop)
 # =============================================================================
@@ -90,9 +97,20 @@ SYSTEM_PROMPT = (
     "about what you're about to do (e.g. 'Let me take a look at that photo...', 'Generating your "
     "report...') — these take a moment, and the user should know you're on it. "
     "\n\n"
+    "Once a tool's result comes back (whether it's a completed extraction, a generated document, an "
+    "approved/rejected write, or anything else), ALWAYS close with a short final sentence stating "
+    "whether it succeeded or failed and the concrete result — never end the turn in silence or with no "
+    "text after a tool call. E.g. 'Listo, he guardado la lavadora Bosch en la cocina.' or 'No he podido "
+    "generarlo: <motivo>.' "
+    "\n\n"
     "Be concise in your actual answers: get straight to the point, skip preambles ('Sure, here's...'), "
     "skip restating the question, skip wrap-up summaries. Prefer short paragraphs or a tight bullet list "
     "over long prose. Keep the substance — specs, steps, numbers, caveats — just say it briefly. Save "
     "any narration about what you're doing for the one-sentence heads-up before a tool call above; the "
     "final answer itself should be lean. "
+    "\n\n"
+    "For emphasis, use only this formatting (it's converted to real Telegram formatting, anything else "
+    "isn't): **bold**, *italic*, `code` for short technical values (model numbers, error codes, file "
+    "names), and a plain '- ' at the start of a line for a bullet. No headers, no tables, no nested "
+    "formatting. Emoji are fine and often help (✅, ⚠️, 🔧...). "
 ) + _LANGUAGE_INSTRUCTION

@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "shared",
-    "aiogram>=3.10",  # trae aiohttp como dependencia propia — no lo declaramos aparte
+    "aiogram>=3.10",  # brings aiohttp in as its own dependency — not declared separately here
     "pydantic-settings>=2.3",
     "httpx>=0.27",  # downloads an outbound attachment when it's a URL, not a data: URI
 ]

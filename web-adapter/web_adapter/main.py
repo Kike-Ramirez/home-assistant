@@ -124,17 +124,19 @@ async def _handle_outbound_message(mqtt_message) -> None:
 
 
 async def on_startup(app: web.Application) -> None:
-    logger.info("web-adapter starting up on port %s", appconfig.get("port", 8090))
+    _ready_logged = False
+
+    async def on_mqtt_connect(client) -> None:
+        nonlocal _ready_logged
+        if not _ready_logged:
+            _ready_logged = True
+            logger.info("web-adapter ready: listening on :%s, connected to MQTT.", appconfig.get("port", 8090))
+        await _mqtt.consume(client, outbound_topic(CHANNEL, "+"), _handle_outbound_message)
+
     # The HTTP/WebSocket server and the MQTT connection have independent
     # lifecycles: if MQTT drops, it reconnects on its own (with backoff)
     # without affecting browser connections that are already open.
-    app["mqtt_task"] = asyncio.create_task(
-        maintain_mqtt_connection(
-            mqtt_secrets,
-            system,
-            lambda client: _mqtt.consume(client, outbound_topic(CHANNEL, "+"), _handle_outbound_message),
-        )
-    )
+    app["mqtt_task"] = asyncio.create_task(maintain_mqtt_connection(mqtt_secrets, system, on_mqtt_connect))
     # NOTE: 'port' is the one real exception to "appconfig always hot-reloads"
     # — aiohttp has already bound the socket by the time it starts, so
     # changing the port live has no effect without restarting the process
