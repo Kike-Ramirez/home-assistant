@@ -37,6 +37,15 @@ MAX_ITERATIONS_FALLBACK = (
     "o darme más detalles?"
 )
 
+# Same reasoning as MAX_ITERATIONS_FALLBACK above — `{status}` is filled in by
+# shared.gemini_client with Gemini's error status (e.g. "RESOURCE_EXHAUSTED" on a
+# quota/rate-limit error). Routed back as a normal reply instead of a crash/silence
+# (see GeminiClient._loop) so the household always hears what's going on.
+API_ERROR_FALLBACK = (
+    "Ahora mismo no puedo hablar con el motor de IA (Gemini) — error: {status}. "
+    "Puede que se haya agotado la cuota o haya un problema temporal; prueba de nuevo en unos minutos."
+)
+
 # =============================================================================
 # The agent loop's system prompt (used by main.py via client.run_agent_loop)
 # =============================================================================

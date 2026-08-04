@@ -64,6 +64,7 @@ def _loop_kwargs() -> dict[str, Any]:
         "async_tool_names": _PAUSE_TOOL_NAMES,
         "max_iterations_fallback": llm.MAX_ITERATIONS_FALLBACK,
         "web_search": appconfig.get("webSearchEnabled", True),
+        "api_error_fallback": llm.API_ERROR_FALLBACK,
     }
 
 

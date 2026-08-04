@@ -28,6 +28,7 @@ from typing import Any, TypeVar
 
 import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, ValidationError
 
@@ -37,6 +38,13 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
 
 DEFAULT_MAX_ITERATIONS_FALLBACK = "I got stuck in a loop on this one — could you rephrase what you need, or give me more detail?"
+
+# `{status}` is filled in with the Gemini API's error status (e.g. "RESOURCE_EXHAUSTED"
+# on a quota/rate-limit error) — kept generic here since this module is domain-agnostic
+# infra; callers (e.g. orchestrator/llm.py) pass a household-appropriate translation.
+DEFAULT_API_ERROR_FALLBACK = (
+    "I can't reach the AI engine right now ({status}) — please try again in a few minutes."
+)
 
 
 @dataclass
@@ -220,13 +228,24 @@ class GeminiClient:
         async_tool_names: frozenset[str],
         max_iterations_fallback: str,
         web_search: bool,
+        api_error_fallback: str,
     ) -> AgentTurnResult:
         config = self._config(system, tools, max_tokens, web_search)
 
         for _ in range(max_iterations):
-            response = await self._client.aio.models.generate_content(
-                model=self._model_name, contents=_decode_thought_signatures(working), config=config
-            )
+            try:
+                response = await self._client.aio.models.generate_content(
+                    model=self._model_name, contents=_decode_thought_signatures(working), config=config
+                )
+            except genai_errors.APIError as exc:
+                # Covers quota/rate-limit errors (429 RESOURCE_EXHAUSTED) and any other
+                # Gemini-side failure (5xx, invalid request, ...): route it back as a
+                # normal reply instead of letting it crash the message handler silently
+                # (shared.mqtt_client.consume only logs unhandled exceptions — the user
+                # would otherwise never hear back at all).
+                message = api_error_fallback.format(status=exc.status or exc.code)
+                return AgentTurnResult(done=True, final_text=message, messages=working)
+
             function_calls = response.function_calls or []
             text = response.text
 
@@ -260,6 +279,7 @@ class GeminiClient:
         async_tool_names: frozenset[str] = frozenset(),
         max_iterations_fallback: str = DEFAULT_MAX_ITERATIONS_FALLBACK,
         web_search: bool = True,
+        api_error_fallback: str = DEFAULT_API_ERROR_FALLBACK,
     ) -> AgentTurnResult:
         return await self._loop(
             system,
@@ -271,6 +291,7 @@ class GeminiClient:
             async_tool_names=async_tool_names,
             max_iterations_fallback=max_iterations_fallback,
             web_search=web_search,
+            api_error_fallback=api_error_fallback,
         )
 
     async def resume_agent_loop(
@@ -286,6 +307,7 @@ class GeminiClient:
         async_tool_names: frozenset[str] = frozenset(),
         max_iterations_fallback: str = DEFAULT_MAX_ITERATIONS_FALLBACK,
         web_search: bool = True,
+        api_error_fallback: str = DEFAULT_API_ERROR_FALLBACK,
     ) -> AgentTurnResult:
         working = list(messages)
         pending_parts = [p for p in working[-1]["parts"] if isinstance(p, dict) and p.get("function_call")]
@@ -310,6 +332,7 @@ class GeminiClient:
             async_tool_names=async_tool_names,
             max_iterations_fallback=max_iterations_fallback,
             web_search=web_search,
+            api_error_fallback=api_error_fallback,
         )
 
     async def call_structured(
