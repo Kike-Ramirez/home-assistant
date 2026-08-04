@@ -319,6 +319,10 @@ async def _kick_off_generation(
         "history": result.messages,
         "pending_agent_turn": tool_use["id"],
         "pending_attachments": [a.model_dump() for a in attachments],
+        # Carried through to the callback (handle_doc_generation_result) so
+        # the rendered file can be auto-saved against the right device — or
+        # as a general household document if the model didn't give one.
+        "pending_device_id": tool_use["input"].get("device_id"),
     }
     await update_state(pg, conversation["id"], paused_state)
 
@@ -433,6 +437,12 @@ async def _kick_off_image_generation(
         "history": result.messages,
         "pending_agent_turn": tool_use["id"],
         "pending_attachments": [a.model_dump() for a in attachments],
+        # Carried through to the callback (handle_image_generation_result) so
+        # the result can be auto-saved against the right device — or as a
+        # general household image if the model didn't give one. Not needed
+        # on the instant-reuse path above (an already-saved photo, nothing
+        # new to save).
+        "pending_device_id": tool_use["input"].get("device_id"),
     }
     await update_state(pg, conversation["id"], paused_state)
 
@@ -495,6 +505,13 @@ async def _resolve_pending_confirmation(
         return
 
     tool_result = await security_guard.resolve(pg, pending, approved)
+    if pending["tool_name"] in ("create_device", "update_device") and isinstance(tool_result, dict) and tool_result.get("id"):
+        # Whatever photo/document led to this device being created or edited
+        # is still in pending_attachments at this point (carried through
+        # every pause/resume in this message's chain) — save it now that
+        # it's actually associated with a device, instead of only ever
+        # existing as extracted data (CLAUDE.md section 10).
+        await _save_onboarding_attachments(pg, tool_result["id"], state.get("pending_attachments", []))
     agent_result = await _resume_agent_loop(pg, state.get("history", []), {pending_tool_use_id: tool_result})
     await _finish_paused_turn(pg, mqtt, conversation, msg.channel, msg.user_id, msg.conversation_id, agent_result)
 
@@ -542,6 +559,7 @@ async def _finish_paused_turn(
             "pending_agent_turn",
             "pending_confirmation",
             "pending_attachments",
+            "pending_device_id",
         )
         await update_state(pg, conversation["id"], new_state)
         if attachment is None:
@@ -553,10 +571,58 @@ async def _finish_paused_turn(
         "pending_agent_turn",
         "pending_confirmation",
         "pending_attachments",
+        "pending_device_id",
     )
     await update_state(pg, conversation["id"], new_state)
     if attachment is None:
         await reply_raw(mqtt, channel, user_id, channel_conversation_id, agent_result.final_text or llm.DEFAULT_DONE_FALLBACK)
+
+
+async def _save_onboarding_attachments(pg: PostgrestClient, device_id: str, pending_attachments: list[dict[str, Any]]) -> None:
+    """Persists the photo(s)/document(s) that led to `device_id` being
+    created or edited — `pending_attachments` (still in `conversation.state`
+    at the moment a `create_device`/`update_device` confirmation resolves)
+    are otherwise never kept anywhere once `extract_device_data` has pulled
+    the structured data out of them (CLAUDE.md section 10). Best-effort, same
+    reasoning as `_save_generated_attachment` — never blocks the actual
+    device write, which has already happened by the time this runs."""
+    for raw in pending_attachments:
+        attachment = Attachment.model_validate(raw)
+        if attachment.kind == AttachmentKind.AUDIO:
+            continue
+        kind = "photo" if attachment.kind == AttachmentKind.IMAGE else "manual"
+        try:
+            await registry.add_device_document(
+                pg,
+                device_id,
+                kind,
+                attachment.url_or_data,
+                description="Foto/documento usado para dar de alta o editar este dispositivo",
+                media_type=attachment.media_type,
+            )
+        except Exception:
+            logger.exception("Couldn't save an onboarding attachment for device %s — the device write is unaffected", device_id)
+
+
+async def _save_generated_attachment(pg: PostgrestClient, device_id: str | None, kind: str, attachment: Attachment) -> None:
+    """Persists anything Gemini sends back to the user (a generated report or
+    image) as a `device_document`, so it's available later exactly like
+    anything the user attached themselves — against `device_id` if the model
+    gave one, or as a general household document (`device_id=None`) if it
+    didn't (CLAUDE.md section 10). Best-effort: a failure here shouldn't ever
+    stop the file from actually reaching the user, so it's logged and
+    swallowed rather than propagated."""
+    try:
+        await registry.add_device_document(
+            pg,
+            device_id,
+            kind,
+            attachment.url_or_data,
+            description=f"Generado por Gemini: {attachment.filename}",
+            media_type=attachment.media_type,
+        )
+    except Exception:
+        logger.exception("Couldn't save the generated %s %r for future reference — delivery is unaffected", kind, attachment.filename)
 
 
 # --- Internal HTTP API (doc-ingestion-worker, doc-generation-worker, image-generation-worker) ---
@@ -613,6 +679,9 @@ async def handle_doc_generation_result(request: web.Request) -> web.Response:
             url_or_data=f"data:{result.media_type};base64,{result.data_base64}",
             filename=result.filename,
         )
+        await _save_generated_attachment(
+            pg, conversation["state"].get("pending_device_id"), kind="report", attachment=attachment
+        )
     else:
         tool_result = {"success": False, "error": result.error or "unknown error"}
 
@@ -646,6 +715,9 @@ async def handle_image_generation_result(request: web.Request) -> web.Response:
             media_type="image/jpeg",
             url_or_data=f"data:image/jpeg;base64,{result.data_base64}",
             filename=result.filename,
+        )
+        await _save_generated_attachment(
+            pg, conversation["state"].get("pending_device_id"), kind="photo", attachment=attachment
         )
     else:
         tool_result = {"success": False, "error": result.error or "unknown error"}

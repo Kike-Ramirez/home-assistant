@@ -127,20 +127,34 @@ CREATE TABLE IF NOT EXISTS home.device_compatibility (
 );
 
 -- =============================================================================
--- 4b. Documents attached to a device (manuals, label photos, free-form notes)
---     — the `attach_document` tool Claude can call directly on a device.
+-- 4b. Documents attached to a device (manuals, label photos, free-form notes,
+--     generated reports/images) — either the `attach_document` tool, or
+--     automatic persistence of anything sent to/from Gemini once it's
+--     associated with a device (CLAUDE.md section 10). `device_id` is
+--     nullable on purpose: NULL means "the whole household in general", not
+--     tied to one specific device (a full-inventory report, an image that
+--     isn't about any one device) — still saved for future access, just
+--     without a device to hang it off of.
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS home.device_document (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id   text NOT NULL DEFAULT 'home',
-    device_id   uuid NOT NULL REFERENCES home.device(id) ON DELETE CASCADE,
-    kind        text NOT NULL,      -- 'photo' | 'manual' | 'note'
+    device_id   uuid REFERENCES home.device(id) ON DELETE CASCADE,
+    kind        text NOT NULL,      -- 'photo' | 'manual' | 'note' | 'report'
     url_or_ref  text NOT NULL,      -- public URL, data: URI, or a Files API reference
+    media_type  text,               -- MIME type, e.g. 'image/jpeg', 'application/pdf' — best-effort, not always known
     description text,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_device_document_device ON home.device_document (device_id);
+
+-- For an already-deployed database, the CREATE TABLE IF NOT EXISTS above is a
+-- no-op — these ALTERs are what actually apply the nullable device_id and the
+-- new media_type column to an existing table (same pattern as
+-- fk_device_owner below, added the same way after the fact).
+ALTER TABLE home.device_document ALTER COLUMN device_id DROP NOT NULL;
+ALTER TABLE home.device_document ADD COLUMN IF NOT EXISTS media_type text;
 
 -- =============================================================================
 -- 5. Users (role + scope, even though there's only one today)

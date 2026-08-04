@@ -68,7 +68,7 @@ async def list_devices(pg: PostgrestClient, include_standards: bool = False) -> 
 
 _DEVICE_DETAIL_COLUMNS = (
     f"{_DEVICE_COLUMNS_WITH_STANDARDS},"
-    "device_document(id,kind,url_or_ref,description,created_at)"
+    "device_document(id,kind,url_or_ref,media_type,description,created_at)"
 )
 
 
@@ -88,30 +88,64 @@ async def get_compatible_devices(pg: PostgrestClient, device_id: str) -> Any:
     return await pg.rpc("compatible_devices", {"p_device_id": device_id})
 
 
+def _device_id_filter(device_id: str | None) -> str:
+    """`device_id=None` means "the household in general", stored as a NULL
+    column (db/schema.sql) — PostgREST's `is.null` operator, not `eq.`, is
+    how that's actually filtered on."""
+    return "is.null" if device_id is None else f"eq.{device_id}"
+
+
 async def add_device_document(
     pg: PostgrestClient,
-    device_id: str,
+    device_id: str | None,
     kind: str,
     url_or_ref: str,
     description: str | None = None,
+    media_type: str | None = None,
 ) -> dict[str, Any]:
+    """`device_id=None` saves it as a general household document (not tied to
+    any one device) instead of failing — used both by the `attach_document`
+    tool and by `main.py`'s automatic persistence of anything sent to/from
+    Gemini once it's associated with a device (or isn't associated with any
+    one device in particular)."""
     return await pg.insert(
         "device_document",
-        {"device_id": device_id, "kind": kind, "url_or_ref": url_or_ref, "description": description},
+        {
+            "device_id": device_id,
+            "kind": kind,
+            "url_or_ref": url_or_ref,
+            "description": description,
+            "media_type": media_type,
+        },
     )
 
 
-async def get_latest_device_photo(pg: PostgrestClient, device_id: str) -> dict[str, Any] | None:
+async def list_house_documents(pg: PostgrestClient) -> list[dict[str, Any]]:
+    """General household documents/images — attached or generated without
+    being tied to any one specific device (a full-inventory report, an image
+    that isn't about a particular device). The `device_id IS NULL` half of
+    `device_document` that `get_device` doesn't cover."""
+    return await pg.select(
+        "device_document",
+        {"select": "id,kind,url_or_ref,media_type,description,created_at", "device_id": _device_id_filter(None)},
+    )
+
+
+async def get_latest_device_photo(pg: PostgrestClient, device_id: str | None) -> dict[str, Any] | None:
     """The most recently attached `device_document` of kind 'photo' for this
-    device, if any. Used by the `generate_image` tool to check for a real
-    photo already on file before searching the web or generating one —
-    `.select()` doesn't support `order`/`limit` (see postgrest_client.py), so
-    with normally just a handful of photos per device, picking the newest in
-    Python is simpler than extending that shared filter-only interface for
-    one caller."""
+    device (or for the household in general, if `device_id` is `None`), if
+    any. Used by the `generate_image` tool to check for a real photo already
+    on file before searching the web or generating one — `.select()` doesn't
+    support `order`/`limit` (see postgrest_client.py), so with normally just a
+    handful of photos per device, picking the newest in Python is simpler
+    than extending that shared filter-only interface for one caller."""
     rows = await pg.select(
         "device_document",
-        {"select": "id,url_or_ref,description,created_at", "device_id": f"eq.{device_id}", "kind": "eq.photo"},
+        {
+            "select": "id,url_or_ref,media_type,description,created_at",
+            "device_id": _device_id_filter(device_id),
+            "kind": "eq.photo",
+        },
     )
     if not rows:
         return None

@@ -72,6 +72,10 @@ async def _get_compatible_devices(pg: PostgrestClient, tool_input: dict[str, Any
     return await registry.get_compatible_devices(pg, tool_input["device_id"])
 
 
+async def _list_house_documents(pg: PostgrestClient, tool_input: dict[str, Any]) -> Any:
+    return await registry.list_house_documents(pg)
+
+
 async def _create_device(pg: PostgrestClient, tool_input: dict[str, Any]) -> Any:
     return await registry.create_device(pg, tool_input)
 
@@ -88,7 +92,7 @@ async def _retire_device(pg: PostgrestClient, tool_input: dict[str, Any]) -> Any
 
 async def _attach_document(pg: PostgrestClient, tool_input: dict[str, Any]) -> Any:
     return await registry.add_device_document(
-        pg, tool_input["device_id"], tool_input["kind"], tool_input["url_or_data"], tool_input.get("description")
+        pg, tool_input.get("device_id"), tool_input["kind"], tool_input["url_or_data"], tool_input.get("description")
     )
 
 
@@ -221,6 +225,20 @@ _TOOLS: list[_Tool] = [
     ),
     _Tool(
         schema={
+            "name": "list_house_documents",
+            "description": (
+                "Returns general household documents/images — ones saved without being tied to any one "
+                "specific device (e.g. a full-inventory report you generated earlier, a photo that wasn't "
+                "about a particular device, documentation covering the whole house). Use this when the "
+                "user asks about something you (or they) saved before that isn't about one device — for "
+                "per-device documents, use get_device instead."
+            ),
+            "input_schema": {"type": "object", "properties": {}},
+        },
+        handler=_list_house_documents,
+    ),
+    _Tool(
+        schema={
             "name": "retire_device",
             "description": (
                 "Retires (soft-deletes) a device that's been removed, replaced, or no longer exists at "
@@ -242,12 +260,17 @@ _TOOLS: list[_Tool] = [
                 "Attaches documentation to an EXISTING device — a manual, a label photo, or a free-form "
                 "note. Use this when a photo/document/text the user sent is meant to be saved as reference "
                 "material for a device they already have — not a new device to onboard (use "
-                "extract_device_data + create_device for that instead)."
+                "extract_device_data + create_device for that instead). Omit device_id when it's general "
+                "household documentation not about any one specific device (e.g. the fuse box, a manual "
+                "covering several appliances) — it's still saved for future reference."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "device_id": {"type": "string"},
+                    "device_id": {
+                        "type": "string",
+                        "description": "Omit for general household documentation not tied to one specific device.",
+                    },
                     "kind": {"type": "string", "enum": ["photo", "manual", "note"]},
                     "url_or_data": {
                         "type": "string",
@@ -255,7 +278,7 @@ _TOOLS: list[_Tool] = [
                     },
                     "description": {"type": "string"},
                 },
-                "required": ["device_id", "kind", "url_or_data"],
+                "required": ["kind", "url_or_data"],
             },
         },
         handler=_attach_document,
@@ -292,11 +315,18 @@ _TOOLS: list[_Tool] = [
                 "'give me a CSV of what's registered'). You write the full content yourself first (pulling "
                 "whatever data you need from list_devices/get_device first) — this tool only converts your "
                 "text into the requested file; it doesn't generate content on its own. This takes a moment; "
-                "say a brief sentence before calling it."
+                "say a brief sentence before calling it. The result is always saved automatically for "
+                "future reference — pass device_id if it's about one specific device (get it from "
+                "get_device/list_devices), omit it if it's about several/all devices or none in particular "
+                "(e.g. a full-inventory report) — it's saved as a general household document either way."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
+                    "device_id": {
+                        "type": "string",
+                        "description": "The one device this document is about, if there is one. Omit for anything broader.",
+                    },
                     "file_type": {"type": "string", "enum": ["pdf", "csv", "txt", "markdown"]},
                     "filename": {"type": "string", "description": "Without extension — it's added automatically."},
                     "content": {
@@ -325,8 +355,11 @@ _TOOLS: list[_Tool] = [
                 "Use this whenever the user asks to see, find, or generate a picture/photo/image of "
                 "something. Always pass device_id when the picture is of a device already in the "
                 "inventory (call get_device/list_devices first if you don't have it) — this both enables "
-                "the reuse check and gives search the best chance of finding the real thing. This takes a "
-                "moment; say a brief sentence before calling it."
+                "the reuse check and gives search the best chance of finding the real thing; omit it for "
+                "anything not about one specific device. A freshly found/generated picture is saved "
+                "automatically (against device_id, or as a general household image if omitted) so a later "
+                "request for the same thing can reuse it instead of searching/generating again. This takes "
+                "a moment; say a brief sentence before calling it."
             ),
             "input_schema": {
                 "type": "object",
