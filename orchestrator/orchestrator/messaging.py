@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from shared.message import Action, MessageType, NormalizedMessage, outbound_topic
+from shared.message import Action, Attachment, MessageType, NormalizedMessage, outbound_topic
 from shared.mqtt_client import ManagedMqttConnection
 
 
 async def reply(
-    client: ManagedMqttConnection, incoming: NormalizedMessage, text: str, actions: list[Action] | None = None
+    client: ManagedMqttConnection,
+    incoming: NormalizedMessage,
+    text: str,
+    actions: list[Action] | None = None,
+    attachments: list[Attachment] | None = None,
 ) -> None:
-    await reply_raw(client, incoming.channel, incoming.user_id, incoming.conversation_id, text, actions)
+    await reply_raw(client, incoming.channel, incoming.user_id, incoming.conversation_id, text, actions, attachments)
 
 
 async def reply_raw(
@@ -19,6 +23,7 @@ async def reply_raw(
     conversation_id: str,
     text: str,
     actions: list[Action] | None = None,
+    attachments: list[Attachment] | None = None,
 ) -> None:
     outgoing = NormalizedMessage(
         channel=channel,
@@ -27,5 +32,6 @@ async def reply_raw(
         type=MessageType.TEXT,
         content=text,
         actions=actions,
+        attachments=attachments or [],
     )
     await client.publish(outbound_topic(channel, user_id), outgoing.model_dump_json(), qos=1)

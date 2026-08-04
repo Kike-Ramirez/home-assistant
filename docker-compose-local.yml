@@ -57,6 +57,20 @@ services:
     networks:
       - barbaraServices
 
+  doc-generation-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.service
+      args:
+        SERVICE: doc-generation-worker
+        MODULE: doc_generation_worker
+    env_file:
+      - barbarasecrets.env
+    volumes:
+      - ./appconfigDev:/appconfig
+    networks:
+      - barbaraServices
+
 # The MQTT broker (Mosquitto), Postgres, PostgREST, InfluxDB, and Grafana are
 # NOT declared here: they're Barbara Marketplace services, already deployed
 # on the node. Our services connect to them by hostname/Barbara's internal

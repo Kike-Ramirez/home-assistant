@@ -15,10 +15,11 @@ first real tool call.
 
 Two tool sets change the agent loop's normal "call it immediately" behavior:
 
-- `ASYNC_TOOL_NAMES` (`extract_device_data`): real async work behind it
-  (doc-ingestion-worker's fire-and-forget `/extract`) — `orchestrator/main.py`
-  kicks it off directly when the loop pauses and injects the result back on
-  resume.
+- `ASYNC_TOOL_NAMES` (`extract_device_data`, `generate_document`): real async
+  work behind them (doc-ingestion-worker's fire-and-forget `/extract`,
+  doc-generation-worker's fire-and-forget `/generate`) — `orchestrator/main.py`
+  kicks the right one off directly when the loop pauses and injects the
+  result back on resume.
 - `CONFIRM_TOOL_NAMES` (`create_device`, `update_device`, `retire_device`):
   writes/destructive changes to the inventory — `orchestrator/main.py` pauses
   the loop the same way, but instead of doing async work it asks the user to
@@ -42,7 +43,7 @@ from shared.postgrest_client import PostgrestClient
 
 from . import registry
 
-ASYNC_TOOL_NAMES = frozenset({"extract_device_data"})
+ASYNC_TOOL_NAMES = frozenset({"extract_device_data", "generate_document"})
 CONFIRM_TOOL_NAMES = frozenset({"create_device", "update_device", "retire_device"})
 
 Handler = Callable[[PostgrestClient, dict[str, Any]], Awaitable[Any]]
@@ -96,6 +97,13 @@ async def _unreachable_extract_device_data(pg: PostgrestClient, tool_input: dict
     registered here only so it has a schema and a name; `dispatch()` must
     never actually be asked to run it."""
     raise AssertionError("extract_device_data must be handled by main.py, never dispatch()")
+
+
+async def _unreachable_generate_document(pg: PostgrestClient, tool_input: dict[str, Any]) -> Any:
+    """Same reasoning as `_unreachable_extract_device_data` — `generate_document`
+    is the other entry in `ASYNC_TOOL_NAMES` with real async work behind it
+    (doc-generation-worker's `/generate`), handled directly by `main.py`."""
+    raise AssertionError("generate_document must be handled by main.py, never dispatch()")
 
 
 _TOOLS: list[_Tool] = [
@@ -265,6 +273,38 @@ _TOOLS: list[_Tool] = [
             },
         },
         handler=_unreachable_extract_device_data,
+    ),
+    _Tool(
+        schema={
+            "name": "generate_document",
+            "description": (
+                "Renders a document you've already written and sends it back to the user as a file "
+                "attachment on this channel. Use this whenever the user asks for a report, an export, or "
+                "any other document in a specific file format (e.g. 'send me a PDF report of my devices', "
+                "'give me a CSV of what's registered'). You write the full content yourself first (pulling "
+                "whatever data you need from list_devices/get_device first) — this tool only converts your "
+                "text into the requested file; it doesn't generate content on its own. This takes a moment; "
+                "say a brief sentence before calling it."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_type": {"type": "string", "enum": ["pdf", "csv", "txt", "markdown"]},
+                    "filename": {"type": "string", "description": "Without extension — it's added automatically."},
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "The full document content, already written out. For pdf/txt/markdown, plain "
+                            "text — lines starting with '#'/'##' are rendered as headings, everything else "
+                            "as a normal paragraph (no bold/italic/tables support). For csv, comma-separated "
+                            "rows including a header row."
+                        ),
+                    },
+                },
+                "required": ["file_type", "filename", "content"],
+            },
+        },
+        handler=_unreachable_generate_document,
     ),
 ]
 

@@ -115,6 +115,14 @@ class DocIngestionWorkerSecrets(BaseSettings):
     url: str
 
 
+class DocGenerationWorkerSecrets(BaseSettings):
+    """Where orchestrator reaches doc-generation-worker to fire a document-rendering job."""
+
+    model_config = SettingsConfigDict(env_prefix="DOC_GENERATION_WORKER_", extra="ignore")
+
+    url: str
+
+
 class SystemConfig(BaseModel):
     debug_level: DebugLevel = Field(default="info", alias="debugLevel")
     connect_timeout_ms: int = Field(default=15000, alias="connectTimeoutMs")

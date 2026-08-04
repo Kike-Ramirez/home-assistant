@@ -13,10 +13,13 @@ just to receive Telegram updates.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 
+import httpx
 from aiogram import Bot, Dispatcher
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.chat_action import ChatActionSender
 
 from shared.message import (
     Attachment,
@@ -35,6 +38,12 @@ logger = logging.getLogger("telegram_adapter")
 
 CHANNEL = "telegram"
 
+# How long to wait, after the last item of a Telegram album ("media group")
+# arrives, before treating it as complete and publishing it as one message
+# with several attachments — Telegram delivers each photo/document of an
+# album as its own separate Update, not as a single message.
+ALBUM_DEBOUNCE_SECONDS = 1.5
+
 bot = Bot(token=telegram_secrets.bot_token)
 dp = Dispatcher()
 
@@ -43,14 +52,78 @@ dp = Dispatcher()
 # per message would be unnecessary and expensive under load.
 _mqtt = ManagedMqttConnection("telegram_adapter")
 
+# media_group_id -> messages collected so far, and the pending flush task —
+# a message with several attachments (a Telegram album) arrives as several
+# separate Updates sharing the same media_group_id.
+_pending_albums: dict[str, list[Message]] = {}
+_album_flush_tasks: dict[str, asyncio.Task] = {}
+
+# user_id -> the "typing..." indicator currently shown for that chat, started
+# as soon as we publish an inbound message and stopped as soon as any reply
+# for that user comes back — gives the household visible feedback that the
+# assistant is working on it, even before the model's own text arrives.
+_typing_senders: dict[str, ChatActionSender] = {}
+
+_http_client = httpx.AsyncClient()
+
 
 async def _publish_inbound(msg: NormalizedMessage) -> None:
     await _mqtt.publish(inbound_topic(CHANNEL, msg.user_id), msg.model_dump_json())
+    sender = ChatActionSender.typing(bot=bot, chat_id=int(msg.user_id))
+    await sender.__aenter__()
+    previous = _typing_senders.pop(msg.user_id, None)
+    if previous is not None:
+        await previous.__aexit__(None, None, None)
+    _typing_senders[msg.user_id] = sender
+
+
+async def _stop_typing(user_id: str) -> None:
+    sender = _typing_senders.pop(user_id, None)
+    if sender is not None:
+        await sender.__aexit__(None, None, None)
 
 
 async def _telegram_file_url(file_id: str) -> str:
     file = await bot.get_file(file_id)
     return f"https://api.telegram.org/file/bot{telegram_secrets.bot_token}/{file.file_path}"
+
+
+async def _attachment_from_message(message: Message) -> Attachment | None:
+    if message.photo:
+        file_url = await _telegram_file_url(message.photo[-1].file_id)
+        return Attachment(kind=AttachmentKind.IMAGE, media_type="image/jpeg", url_or_data=file_url)
+    if message.document:
+        file_url = await _telegram_file_url(message.document.file_id)
+        return Attachment(
+            kind=AttachmentKind.DOCUMENT,
+            media_type=message.document.mime_type,
+            url_or_data=file_url,
+            filename=message.document.file_name,
+        )
+    return None
+
+
+async def _flush_album(media_group_id: str) -> None:
+    await asyncio.sleep(ALBUM_DEBOUNCE_SECONDS)
+    messages = _pending_albums.pop(media_group_id, [])
+    _album_flush_tasks.pop(media_group_id, None)
+    if not messages:
+        return
+
+    messages.sort(key=lambda m: m.message_id)
+    attachments = [a for a in await asyncio.gather(*(_attachment_from_message(m) for m in messages)) if a is not None]
+    caption = next((m.caption for m in messages if m.caption), None)
+    first = messages[0]
+
+    msg = NormalizedMessage(
+        channel=CHANNEL,
+        user_id=str(first.chat.id),
+        conversation_id=str(first.chat.id),
+        type=MessageType.TEXT,
+        content=caption,
+        attachments=attachments,
+    )
+    await _publish_inbound(msg)
 
 
 @dp.message()
@@ -60,32 +133,37 @@ async def on_telegram_message(message: Message) -> None:
     # the orchestrator upserts home.conversation by (channel, channel_conversation_id).
     conversation_id = str(message.chat.id)
 
+    if message.media_group_id and (message.photo or message.document):
+        # Part of an album — buffer it and (re)schedule the flush instead of
+        # publishing immediately, so every attachment in the album ends up on
+        # the same NormalizedMessage (CLAUDE.md's multi-attachment handling).
+        group_id = message.media_group_id
+        _pending_albums.setdefault(group_id, []).append(message)
+        existing_task = _album_flush_tasks.get(group_id)
+        if existing_task is not None:
+            existing_task.cancel()
+        _album_flush_tasks[group_id] = asyncio.create_task(_flush_album(group_id))
+        return
+
     if message.photo:
-        file_url = await _telegram_file_url(message.photo[-1].file_id)
+        attachment = await _attachment_from_message(message)
         msg = NormalizedMessage(
             channel=CHANNEL,
             user_id=user_id,
             conversation_id=conversation_id,
             type=MessageType.TEXT,
             content=message.caption,
-            attachments=[Attachment(kind=AttachmentKind.IMAGE, media_type="image/jpeg", url_or_data=file_url)],
+            attachments=[attachment] if attachment else [],
         )
     elif message.document:
-        file_url = await _telegram_file_url(message.document.file_id)
+        attachment = await _attachment_from_message(message)
         msg = NormalizedMessage(
             channel=CHANNEL,
             user_id=user_id,
             conversation_id=conversation_id,
             type=MessageType.TEXT,
             content=message.caption,
-            attachments=[
-                Attachment(
-                    kind=AttachmentKind.DOCUMENT,
-                    media_type=message.document.mime_type,
-                    url_or_data=file_url,
-                    filename=message.document.file_name,
-                )
-            ],
+            attachments=[attachment] if attachment else [],
         )
     elif message.text and message.text.startswith("/"):
         msg = NormalizedMessage(
@@ -142,9 +220,31 @@ def _build_reply_markup(msg: NormalizedMessage) -> InlineKeyboardMarkup | None:
     )
 
 
+async def _attachment_bytes(attachment: Attachment) -> bytes:
+    if attachment.url_or_data.startswith("data:"):
+        _, _, b64_data = attachment.url_or_data.partition(",")
+        return base64.b64decode(b64_data)
+    response = await _http_client.get(attachment.url_or_data)
+    response.raise_for_status()
+    return response.content
+
+
 async def _handle_outbound_message(mqtt_message) -> None:
     msg = NormalizedMessage.model_validate_json(mqtt_message.payload)
-    await bot.send_message(chat_id=int(msg.user_id), text=msg.content or "", reply_markup=_build_reply_markup(msg))
+    await _stop_typing(msg.user_id)
+
+    chat_id = int(msg.user_id)
+    reply_markup = _build_reply_markup(msg)
+
+    if msg.content:
+        await bot.send_message(chat_id=chat_id, text=msg.content, reply_markup=reply_markup)
+    elif not msg.attachments:
+        await bot.send_message(chat_id=chat_id, text="", reply_markup=reply_markup)
+
+    for attachment in msg.attachments:
+        data = await _attachment_bytes(attachment)
+        document = BufferedInputFile(data, filename=attachment.filename or "documento")
+        await bot.send_document(chat_id=chat_id, document=document)
 
 
 async def main() -> None:
@@ -165,6 +265,7 @@ async def main() -> None:
     finally:
         mqtt_task.cancel()
         config_task.cancel()
+        await _http_client.aclose()
 
 
 if __name__ == "__main__":

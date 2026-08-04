@@ -10,6 +10,7 @@ members = [
     "web-adapter",
     "orchestrator",
     "doc-ingestion-worker",
+    "doc-generation-worker",
 ]
 
 [build-system]

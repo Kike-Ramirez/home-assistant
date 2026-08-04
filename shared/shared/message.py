@@ -88,3 +88,32 @@ class DocIngestionResult(BaseModel):
     success: bool
     error: str | None = None
     draft_device: dict | None = None  # display_name, brand, model, device_type_code, attributes, isa95_area
+
+
+class DocGenerationRequest(BaseModel):
+    """Body of orchestrator's POST to doc-generation-worker's `/generate`
+    (the `generate_document` tool) — the model has already written the actual
+    content; this service only renders it into the requested file format."""
+
+    conversation_id: str  # home.conversation id (uuid), for internal correlation
+    channel_conversation_id: str
+    channel: str
+    user_id: str
+    file_type: str  # "pdf" | "csv" | "txt" | "markdown"
+    filename: str
+    content: str
+
+
+class DocGenerationResult(BaseModel):
+    """Body of doc-generation-worker's POST back to orchestrator's
+    `/internal/doc-generation/result`, with the rendered file (or an error)."""
+
+    conversation_id: str
+    channel_conversation_id: str
+    channel: str
+    user_id: str
+    success: bool
+    error: str | None = None
+    filename: str | None = None
+    media_type: str | None = None
+    data_base64: str | None = None

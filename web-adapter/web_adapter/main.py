@@ -117,7 +117,10 @@ async def _handle_outbound_message(mqtt_message) -> None:
     msg = NormalizedMessage.model_validate_json(mqtt_message.payload)
     ws = _connections.get(msg.user_id)
     if ws is not None and not ws.closed:
-        await ws.send_str(json.dumps({"text": _render_text(msg)}))
+        attachments = [
+            {"filename": a.filename, "media_type": a.media_type, "data_uri": a.url_or_data} for a in msg.attachments
+        ]
+        await ws.send_str(json.dumps({"text": _render_text(msg), "attachments": attachments}))
 
 
 async def on_startup(app: web.Application) -> None:

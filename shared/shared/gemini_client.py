@@ -318,6 +318,16 @@ class GeminiClient:
             if call_id in resolved_tool_results:
                 response = _stringify_tool_result(resolved_tool_results[call_id])
                 return {"function_response": {"id": call_id, "name": name, "response": response}}
+            if name in async_tool_names:
+                # A second pausing call bundled in the same batch as the one we're
+                # resolving right now (e.g. two extract_device_data calls for two
+                # attachments at once). It must NOT fall through to tool_executor:
+                # for a write tool that would dispatch it straight to PostgREST,
+                # bypassing Human-in-the-Loop approval entirely; for
+                # extract_device_data it would hit the unreachable handler. Tell the
+                # model to ask again one at a time instead.
+                response = {"success": False, "error": "Not processed yet — handle one attachment/action at a time and wait for its result before requesting the next."}
+                return {"function_response": {"id": call_id, "name": name, "response": response}}
             return await _run_one_tool(tool_executor, call_id, name, args)
 
         results = await asyncio.gather(*(_run(p) for p in pending_parts))
