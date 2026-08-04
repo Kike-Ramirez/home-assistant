@@ -44,6 +44,11 @@ flowchart LR
     ORCH -- "POST /generate" --> DGW[doc-generation-worker]
     DGW -- "POST /internal/doc-generation/result" --> ORCH
 
+    ORCH -- "POST /generate-image" --> IGW[image-generation-worker]
+    IGW -- "POST /internal/image/result" --> ORCH
+    IGW -- "image search" --> CSE[Google Custom Search]
+    IGW -- "generation fallback" --> GEMINI
+
     ORCH <-- REST --> PGRST[(PostgREST)]
     PGRST <--> PG[(Postgres)]
     ORCH -- "tool calls + approval gate" --> GEMINI
@@ -59,6 +64,7 @@ flowchart LR
 - **Channel adapters** (`telegram-adapter`, `web-adapter`) are the one deliberate exception on the inbound/outbound side: each manages its own Telegram/WebSocket connection *and* its own MQTT connection, publishing/subscribing directly to `home/inbound/<channel>/*` and `home/outbound/<channel>/*`. They're dumb translators — they turn whatever the channel gives them into a normalized message and publish it, and turn outbound normalized messages (including approval-prompt buttons and generated-file attachments) back into channel-native replies. The `orchestrator` never knows or cares which channel a message came from.
 - **`doc-ingestion-worker`** is the other deliberate exception: it keeps its own Gemini client for vision extraction (see [Design notes](#design-notes) for why), but has no MQTT or PostgREST connection at all — `orchestrator` calls its `POST /extract` directly, and it calls back to `orchestrator`'s `POST /internal/doc-ingestion/result` when done, since a vision extraction can take a while and shouldn't block the caller.
 - **`doc-generation-worker`** follows the same "reached over the internal API, no MQTT/PostgREST" shape as `doc-ingestion-worker`, but with no exception at all — it does no content generation of its own (Gemini already wrote the document's text before calling the `generate_document` tool), only renders it into a file, so it doesn't need a Gemini client either.
+- **`image-generation-worker`** also has no MQTT/PostgREST, but it's the one service that needs both its own Gemini client *and* an external HTTP call of its own (Google's Custom Search API) — it tries a real photo search first for the `generate_image` tool, and only falls back to generating one with Gemini when search finds nothing usable or isn't configured.
 
 Adding a new channel (WhatsApp, Slack, voice, whatever) is still just a matter of writing one more adapter that speaks the same MQTT contract — that part of the design is unchanged.
 
@@ -71,6 +77,7 @@ Adding a new channel (WhatsApp, Slack, voice, whatever) is still just a matter o
 | [`orchestrator`](./orchestrator) | The brain: runs Gemini's tool-use agent loop on every message, gating write tools on human approval — no intent routing of its own | Stateless — conversation state (the Gemini message transcript) lives in Postgres, not in the process, so it can scale to replicas. The only service connected to MQTT/PostgREST/Gemini for everything that isn't the one exception above; exposes a small internal HTTP API for `doc-ingestion-worker` |
 | [`doc-ingestion-worker`](./doc-ingestion-worker) | Extracts device data from a photo via Gemini vision, when Gemini calls the `extract_device_data` tool | No MQTT, no PostgREST — called via `POST /extract`, calls back via `POST /internal/doc-ingestion/result`. Own bounded-concurrency queue so a slow extraction never blocks the chat flow. Keeps its own Gemini client (the one narrow exception to full centralization — see Design notes) |
 | [`doc-generation-worker`](./doc-generation-worker) | Renders a document (PDF/CSV/TXT/Markdown) Gemini already wrote the content for, when Gemini calls the `generate_document` tool | No MQTT, no PostgREST, no Gemini client — called via `POST /generate`, calls back via `POST /internal/doc-generation/result` with the rendered file, which `orchestrator` delivers as a channel attachment |
+| [`image-generation-worker`](./image-generation-worker) | Gets a real picture (Google Custom Search) or generates one (Gemini fallback) when Gemini calls the `generate_image` tool | No MQTT, no PostgREST — called via `POST /generate-image`, calls back via `POST /internal/image/result` with a JPEG, delivered as a Telegram photo (`sendPhoto`, not a generic file) |
 | [`shared`](./shared) | Common library: message contract, MQTT/PostgREST clients, internal HTTP client, config/logging, the Gemini client | Not a deployable service — a workspace package the others depend on |
 
 ## External services (not part of this repo)
@@ -97,13 +104,14 @@ Monorepo, `uv` workspace. One Python package per service, plus `shared`:
 ├── orchestrator/
 ├── doc-ingestion-worker/
 ├── doc-generation-worker/
+├── image-generation-worker/
 ├── db/schema.sql           # Postgres DDL (schema `home`, served by PostgREST)
 ├── appconfigDev/           # local-only: appconfig.json (app-level) + global.json (device-level, unused today)
 ├── barbarasecrets.env      # local-only: every service's secrets, in one file
 ├── docker-compose.yml      # for the Barbara edge node — pulls pre-built images from Docker Hub, no build/secrets/appconfig here
 ├── docker-compose-local.yml # for local debugging — builds from source, mounting appconfigDev/ and barbarasecrets.env
-├── Dockerfile.service      # one generic Dockerfile for all 5 services, parameterized via build args
-├── build-and-push-images.sh # builds + tags + pushes all 5 images to Docker Hub — see below
+├── Dockerfile.service      # one generic Dockerfile for all 6 services, parameterized via build args
+├── build-and-push-images.sh # builds + tags + pushes all 6 images to Docker Hub — see below
 └── pyproject.toml          # workspace root
 ```
 
@@ -155,18 +163,19 @@ If you're developing without Docker at all: it's a standard `uv` workspace, so `
 | `orchestrator` | `kikeramirez/home-assistant-orchestrator` | https://hub.docker.com/r/kikeramirez/home-assistant-orchestrator |
 | `doc-ingestion-worker` | `kikeramirez/home-assistant-doc-ingestion-worker` | https://hub.docker.com/r/kikeramirez/home-assistant-doc-ingestion-worker |
 | `doc-generation-worker` | `kikeramirez/home-assistant-doc-generation-worker` | https://hub.docker.com/r/kikeramirez/home-assistant-doc-generation-worker |
+| `image-generation-worker` | `kikeramirez/home-assistant-image-generation-worker` | https://hub.docker.com/r/kikeramirez/home-assistant-image-generation-worker |
 
 `docker-compose-local.yml` is unaffected by any of this — it still builds straight from `Dockerfile.service` for local debugging, always with your latest local changes, never from Docker Hub.
 
 ### Publishing images to Docker Hub
 
-`build-and-push-images.sh` (repo root) builds from `Dockerfile.service` — same one `docker-compose-local.yml` uses — and pushes to the 5 repositories above. Log in once per machine/session (always interactive, never scripted):
+`build-and-push-images.sh` (repo root) builds from `Dockerfile.service` — same one `docker-compose-local.yml` uses — and pushes to the 6 repositories above. Log in once per machine/session (always interactive, never scripted):
 
 ```bash
 docker login
 ```
 
-**All 5 at once** (the common case — e.g. after a change to `shared/`, which every service depends on):
+**All 6 at once** (the common case — e.g. after a change to `shared/`, which every service depends on):
 
 ```bash
 ./build-and-push-images.sh
@@ -179,7 +188,7 @@ docker login
 ./build-and-push-images.sh orchestrator web-adapter    # a few, space-separated
 ```
 
-Valid names: `telegram-adapter`, `web-adapter`, `orchestrator`, `doc-ingestion-worker`, `doc-generation-worker` (an unknown name fails fast with that list, instead of silently building nothing). Combine with either mode:
+Valid names: `telegram-adapter`, `web-adapter`, `orchestrator`, `doc-ingestion-worker`, `doc-generation-worker`, `image-generation-worker` (an unknown name fails fast with that list, instead of silently building nothing). Combine with either mode:
 
 ```bash
 ./build-and-push-images.sh --build-only                    # build all 5, push none — sanity-check first
@@ -197,9 +206,10 @@ A few decisions worth knowing about before you start reading code:
 
 - **`orchestrator` owns every external/shared connection, with one named exception.** MQTT, PostgREST, and the Gemini API (for the conversational flow) are only ever touched by `orchestrator`. The channel adapters (`telegram-adapter`, `web-adapter`) are the exception on the inbound/outbound side — each manages its own channel connection *and* its own MQTT connection, since they need to publish/subscribe on the bus directly as "external" services in their own right. `doc-ingestion-worker` has no MQTT or PostgREST connection at all — it talks to `orchestrator` over a small internal HTTP API (`shared/shared/internal_client.py`'s `InternalApiClient`, a thin `httpx` wrapper with bounded retry — deliberately *not* retry-forever like the MQTT reconnect loop, since these are one-off calls tied to something happening right now, not a long-lived connection worth resurrecting indefinitely).
 - **`doc-ingestion-worker` keeps its own Gemini client — the one deliberate exception to full centralization.** Routing its vision-extraction call through `orchestrator` would mean `orchestrator` calls `doc-ingestion-worker` to extract → `doc-ingestion-worker` would have to call back into `orchestrator` just to reach Gemini → `orchestrator` would need to relay the result back to `doc-ingestion-worker` again. That's a circular hop for no benefit, so `doc-ingestion-worker` keeps a narrow, direct `GeminiClient` of its own, purely for vision extraction — everything else about its connectivity (no MQTT, no PostgREST) still follows the centralization rule.
-- **No hand-rolled intent detection — Gemini drives everything via tool-use, orchestrator only executes.** There's no fixed set of flows and no branching on message type: every inbound message (text, an image, a document, a pasted URL, any combination) goes into one Gemini tool-use agent loop (`shared.gemini_client.GeminiClient.run_agent_loop`) with the tools in [`orchestrator/orchestrator/actions.py`](./orchestrator/orchestrator/actions.py) — `list_devices`, `get_device`, `get_compatible_devices`, `create_device`, `update_device`, `retire_device`, `attach_document`, `extract_device_data`, `generate_document`, plus the built-in `google_search` grounding. Gemini decides which (if any) to call; content that's pure generation (a troubleshooting answer, a course, a replacement recommendation, the text of a generated report) is just its own final text or tool input, not a separate code path. A photo isn't automatically "a new device" — Gemini looks at it and decides (label → onboard it; error code on a screen → troubleshoot; documentation for something you already have → attach it).
+- **No hand-rolled intent detection — Gemini drives everything via tool-use, orchestrator only executes.** There's no fixed set of flows and no branching on message type: every inbound message (text, an image, a document, a pasted URL, any combination) goes into one Gemini tool-use agent loop (`shared.gemini_client.GeminiClient.run_agent_loop`) with the tools in [`orchestrator/orchestrator/actions.py`](./orchestrator/orchestrator/actions.py) — `list_devices`, `get_device`, `get_compatible_devices`, `create_device`, `update_device`, `retire_device`, `attach_document`, `extract_device_data`, `generate_document`, `generate_image`, plus the built-in `google_search` grounding. Gemini decides which (if any) to call; content that's pure generation (a troubleshooting answer, a course, a replacement recommendation, the text of a generated report) is just its own final text or tool input, not a separate code path. A photo isn't automatically "a new device" — Gemini looks at it and decides (label → onboard it; error code on a screen → troubleshoot; documentation for something you already have → attach it).
 - **A message with several attachments (e.g. a Telegram album) is handled one attachment at a time, chained across pause/resume cycles.** `telegram-adapter` buffers an album (Telegram delivers each photo as its own Update sharing a `media_group_id`) into a single `NormalizedMessage` with several `attachments`, and `orchestrator` walks through them sequentially — `extract_device_data` for one, its Human-in-the-Loop approval if it leads to a write, then the next — instead of trying to batch them (Gemini's own function-calling could ask for two pausing tools in the same turn, but `orchestrator` only ever resolves one at a time and `shared.gemini_client` refuses to silently auto-run the others, so a second write never slips past approval). `conversation.state.pending_attachments` keeps the original attachments available across however many round trips that takes.
 - **A generated file is delivered as soon as it's rendered, as an attachment on the same channel.** `generate_document` asks Gemini to write the actual content first (a report, an export, whatever), then hands it to `doc-generation-worker` purely to render it into the requested format — the result comes back as a `shared.message.Attachment` on the reply, decoded and sent as a real file by whichever adapter is in play (`bot.send_document` on Telegram, a download link on the web chat).
+- **An image request checks for one already on file before searching or generating a new one.** `generate_image`, given a `device_id`, first checks that device's attached documents (`home.device_document`, kind `photo`) and reuses one if it's still fetchable — only then does it fall through to `image-generation-worker` (a real Google Custom Search image lookup first, Gemini generation as the fallback). Either way the result is always a real JPEG, delivered via Telegram's `sendPhoto` (an inline preview, not a generic downloadable file — `AttachmentKind.IMAGE` vs. `AttachmentKind.DOCUMENT` on the `Attachment`).
 - **Human-in-the-Loop approval gates every write.** `create_device`/`update_device`/`retire_device` pause the agent loop the same way the async vision-extraction/document-generation tools do, but instead of doing background work, `orchestrator` asks the user to approve or reject via the channel (Telegram inline buttons, or a plain sí/no reply elsewhere — see [`orchestrator/orchestrator/security_guard.py`](./orchestrator/orchestrator/security_guard.py)) before the call ever reaches PostgREST. Read-only tools (`list_devices`, `get_device`, `get_compatible_devices`) and the purely-additive `attach_document` execute immediately — no approval needed.
 - **Conversation state is the Gemini transcript itself.** `conversation.state.history` is the literal list of messages replayed each turn — quiz progress, corrections mid-onboarding, which device a "yes" refers to are all just Gemini re-reading its own prior turns, not a hand-rolled state machine. Only one tool call is resolved per pause/resume round trip (see the multi-attachment note above) — no other tool in that batch runs, so a side-effecting call never executes only to be discarded.
 - **Descriptive while working, concise once it answers.** `telegram-adapter` shows Telegram's native "escribiendo..." indicator for as long as a turn is in flight, and `SYSTEM_PROMPT` (`orchestrator/orchestrator/llm.py`) asks Gemini for a one-sentence heads-up before any tool call that takes a moment — but the same prompt also asks it to keep the actual answer itself short and to the point, no preambles or wrap-up summaries.

@@ -15,11 +15,12 @@ first real tool call.
 
 Two tool sets change the agent loop's normal "call it immediately" behavior:
 
-- `ASYNC_TOOL_NAMES` (`extract_device_data`, `generate_document`): real async
-  work behind them (doc-ingestion-worker's fire-and-forget `/extract`,
-  doc-generation-worker's fire-and-forget `/generate`) — `orchestrator/main.py`
-  kicks the right one off directly when the loop pauses and injects the
-  result back on resume.
+- `ASYNC_TOOL_NAMES` (`extract_device_data`, `generate_document`,
+  `generate_image`): real async work behind them (doc-ingestion-worker's
+  fire-and-forget `/extract`, doc-generation-worker's fire-and-forget
+  `/generate`, image-generation-worker's fire-and-forget `/generate-image`)
+  — `orchestrator/main.py` kicks the right one off directly when the loop
+  pauses and injects the result back on resume.
 - `CONFIRM_TOOL_NAMES` (`create_device`, `update_device`, `retire_device`):
   writes/destructive changes to the inventory — `orchestrator/main.py` pauses
   the loop the same way, but instead of doing async work it asks the user to
@@ -43,7 +44,7 @@ from shared.postgrest_client import PostgrestClient
 
 from . import registry
 
-ASYNC_TOOL_NAMES = frozenset({"extract_device_data", "generate_document"})
+ASYNC_TOOL_NAMES = frozenset({"extract_device_data", "generate_document", "generate_image"})
 CONFIRM_TOOL_NAMES = frozenset({"create_device", "update_device", "retire_device"})
 
 Handler = Callable[[PostgrestClient, dict[str, Any]], Awaitable[Any]]
@@ -104,6 +105,13 @@ async def _unreachable_generate_document(pg: PostgrestClient, tool_input: dict[s
     is the other entry in `ASYNC_TOOL_NAMES` with real async work behind it
     (doc-generation-worker's `/generate`), handled directly by `main.py`."""
     raise AssertionError("generate_document must be handled by main.py, never dispatch()")
+
+
+async def _unreachable_generate_image(pg: PostgrestClient, tool_input: dict[str, Any]) -> Any:
+    """Same reasoning as `_unreachable_extract_device_data` — `generate_image`
+    is the third entry in `ASYNC_TOOL_NAMES` with real async work behind it
+    (image-generation-worker's `/generate-image`), handled directly by `main.py`."""
+    raise AssertionError("generate_image must be handled by main.py, never dispatch()")
 
 
 _TOOLS: list[_Tool] = [
@@ -305,6 +313,49 @@ _TOOLS: list[_Tool] = [
             },
         },
         handler=_unreachable_generate_document,
+    ),
+    _Tool(
+        schema={
+            "name": "generate_image",
+            "description": (
+                "Gets a picture and sends it back to the user as a photo on this channel. If device_id is "
+                "given, FIRST checks whether a real photo is already attached to that device (from "
+                "get_device's device_document list, kind 'photo') and reuses it — only if none exists does "
+                "it try an actual web image search, falling back to generating one if that finds nothing. "
+                "Use this whenever the user asks to see, find, or generate a picture/photo/image of "
+                "something. Always pass device_id when the picture is of a device already in the "
+                "inventory (call get_device/list_devices first if you don't have it) — this both enables "
+                "the reuse check and gives search the best chance of finding the real thing. This takes a "
+                "moment; say a brief sentence before calling it."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "device_id": {
+                        "type": "string",
+                        "description": (
+                            "The device this picture is of, if it's one already in the inventory — enables "
+                            "reusing a photo already on file instead of searching/generating a new one. "
+                            "Omit for anything that isn't an existing device."
+                        ),
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "What the picture should show — be as specific as possible (exact brand/model "
+                            "if it's a real product) so a real photo search has the best chance of finding it. "
+                            "Used even when device_id is given, in case no existing photo is found."
+                        ),
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Short, descriptive, without extension — it's added automatically and always .jpg.",
+                    },
+                },
+                "required": ["query", "filename"],
+            },
+        },
+        handler=_unreachable_generate_image,
     ),
 ]
 

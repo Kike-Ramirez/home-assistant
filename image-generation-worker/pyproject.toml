@@ -1,0 +1,19 @@
+[project]
+name = "image-generation-worker"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "shared",
+    "pydantic-settings>=2.3",
+    "aiohttp>=3.9",       # /generate-image endpoint — no MQTT, orchestrator calls this directly
+    "httpx>=0.27",        # Custom Search API call + downloading the winning result
+    "google-genai>=0.3",  # Gemini image-generation fallback — used directly, not just transitively via shared
+    "pillow>=10.0",       # normalizes whatever format comes back (search result or Gemini output) to JPEG
+]
+
+[tool.uv.sources]
+shared = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

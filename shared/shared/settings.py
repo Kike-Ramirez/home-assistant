@@ -161,6 +161,18 @@ class DocGenerationWorkerSecrets(BaseSettings):
     url: str = "http://doc-generation-worker:8080"
 
 
+class ImageGenerationWorkerSecrets(BaseSettings):
+    """Where orchestrator reaches image-generation-worker to fire an image request.
+
+    Same reasoning as `OrchestratorSecrets` above — a fixed internal
+    Docker Compose hostname/port, not a per-deployment secret.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="IMAGE_GENERATION_WORKER_", extra="ignore")
+
+    url: str = "http://image-generation-worker:8080"
+
+
 class SystemConfig(BaseModel):
     debug_level: DebugLevel = Field(default="info", alias="debugLevel")
     connect_timeout_ms: int = Field(default=15000, alias="connectTimeoutMs")

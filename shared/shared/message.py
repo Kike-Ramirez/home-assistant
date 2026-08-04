@@ -117,3 +117,34 @@ class DocGenerationResult(BaseModel):
     filename: str | None = None
     media_type: str | None = None
     data_base64: str | None = None
+
+
+class ImageRequest(BaseModel):
+    """Body of orchestrator's POST to image-generation-worker's
+    `/generate-image` (the `generate_image` tool) — `query` is what the
+    model wants a picture of (e.g. an exact product name/model, or a scene
+    description); `filename` is the model's own suggested descriptive name
+    (no extension — the result is always normalized to `.jpg` regardless of
+    source)."""
+
+    conversation_id: str  # home.conversation id (uuid), for internal correlation
+    channel_conversation_id: str
+    channel: str
+    user_id: str
+    query: str
+    filename: str
+
+
+class ImageResult(BaseModel):
+    """Body of image-generation-worker's POST back to orchestrator's
+    `/internal/image/result`, with the resulting JPEG (or an error)."""
+
+    conversation_id: str
+    channel_conversation_id: str
+    channel: str
+    user_id: str
+    success: bool
+    error: str | None = None
+    filename: str | None = None
+    source: str | None = None  # "search" | "generated" — which path actually produced the image
+    data_base64: str | None = None

@@ -1,6 +1,6 @@
 name: Build and push service images
 
-# Builds all 5 service images (same Dockerfile.service / build-arg pattern as
+# Builds all 6 service images (same Dockerfile.service / build-arg pattern as
 # build-and-push-images.sh) and pushes them to Docker Hub, one repo per
 # service, on every push to main. workflow_dispatch lets you also trigger a
 # rebuild by hand from the Actions tab without needing a new commit.
@@ -30,6 +30,8 @@ jobs:
             module: doc_ingestion_worker
           - service: doc-generation-worker
             module: doc_generation_worker
+          - service: image-generation-worker
+            module: image_generation_worker
     steps:
       - name: Checkout
         uses: actions/checkout@v4

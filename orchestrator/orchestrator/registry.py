@@ -99,3 +99,20 @@ async def add_device_document(
         "device_document",
         {"device_id": device_id, "kind": kind, "url_or_ref": url_or_ref, "description": description},
     )
+
+
+async def get_latest_device_photo(pg: PostgrestClient, device_id: str) -> dict[str, Any] | None:
+    """The most recently attached `device_document` of kind 'photo' for this
+    device, if any. Used by the `generate_image` tool to check for a real
+    photo already on file before searching the web or generating one —
+    `.select()` doesn't support `order`/`limit` (see postgrest_client.py), so
+    with normally just a handful of photos per device, picking the newest in
+    Python is simpler than extending that shared filter-only interface for
+    one caller."""
+    rows = await pg.select(
+        "device_document",
+        {"select": "id,url_or_ref,description,created_at", "device_id": f"eq.{device_id}", "kind": "eq.photo"},
+    )
+    if not rows:
+        return None
+    return max(rows, key=lambda r: r["created_at"])

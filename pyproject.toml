@@ -11,6 +11,7 @@ members = [
     "orchestrator",
     "doc-ingestion-worker",
     "doc-generation-worker",
+    "image-generation-worker",
 ]
 
 [build-system]

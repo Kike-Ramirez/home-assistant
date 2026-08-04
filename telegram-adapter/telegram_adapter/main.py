@@ -258,8 +258,15 @@ async def _handle_outbound_message(mqtt_message) -> None:
 
     for attachment in msg.attachments:
         data = await _attachment_bytes(attachment)
-        document = BufferedInputFile(data, filename=attachment.filename or "documento")
-        await bot.send_document(chat_id=chat_id, document=document)
+        filename = attachment.filename or "documento"
+        if attachment.kind == AttachmentKind.IMAGE:
+            # sendPhoto renders inline (a real preview in the chat) instead of
+            # a generic downloadable file — the better delivery for a photo,
+            # whether it came from an image search or was generated (both
+            # always JPEG — see image-generation-worker/convert.py).
+            await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(data, filename=filename))
+        else:
+            await bot.send_document(chat_id=chat_id, document=BufferedInputFile(data, filename=filename))
 
 
 async def main() -> None:

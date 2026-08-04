@@ -18,6 +18,14 @@ without executing a tool (`actions.ASYNC_TOOL_NAMES | actions.CONFIRM_TOOL_NAMES
   to render a file the model already wrote the content for — resumed when
   that service calls back (`handle_doc_generation_result`), and the rendered
   file is delivered to the user as an attachment on that same reply.
+- `generate_image`: if `device_id` is given, first checks for a photo
+  already attached to that device (`registry.get_latest_device_photo`) and,
+  if one's found and still fetchable, resolves immediately with no worker
+  round trip at all. Otherwise same shape as the other two: an HTTP round
+  trip to image-generation-worker (real image search first, Gemini
+  generation as a fallback) — resumed when that service calls back
+  (`handle_image_generation_result`). Either way, delivered as a Telegram
+  photo (not a generic file) via `AttachmentKind.IMAGE`.
 - `create_device` / `update_device` / `retire_device`: writes to the
   inventory, gated on the user's explicit approval (Human-in-the-Loop) —
   sent out as a channel message with `actions` (Aprobar/Rechazar buttons) —
@@ -37,16 +45,19 @@ Runs two independent things side by side: the MQTT connection (consuming
 `home/inbound/+/+`, same as before) and a small internal HTTP API — reachable
 only on the `barbaraServices` Docker network, no host port published, no auth
 (same trusted-LAN reasoning as PostgREST without JWT and web-adapter without
-a login) — that doc-ingestion-worker and doc-generation-worker call instead of
-talking to MQTT/PostgREST themselves.
+a login) — that doc-ingestion-worker, doc-generation-worker, and
+image-generation-worker call instead of talking to MQTT/PostgREST themselves.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import re
 from typing import Any
 
+import httpx
 from aiohttp import web
 from shared.gemini_client import AgentTurnResult
 from shared.internal_client import InternalApiClient
@@ -57,6 +68,8 @@ from shared.message import (
     DocGenerationResult,
     DocIngestionRequest,
     DocIngestionResult,
+    ImageRequest,
+    ImageResult,
     MessageType,
     NormalizedMessage,
 )
@@ -64,12 +77,13 @@ from shared.mqtt_client import ManagedMqttConnection, maintain_mqtt_connection
 from shared.postgrest_client import PostgrestClient
 from shared.settings import watch_appconfig
 
-from . import actions, llm, security_guard
+from . import actions, llm, registry, security_guard
 from .config import (
     SERVICE_NAME,
     appconfig,
     doc_generation_worker_secrets,
     doc_ingestion_worker_secrets,
+    image_generation_worker_secrets,
     mqtt_secrets,
     postgrest_secrets,
     system,
@@ -83,6 +97,7 @@ logger = logging.getLogger("orchestrator")
 _mqtt = ManagedMqttConnection("orchestrator")
 _doc_ingestion_client = InternalApiClient(doc_ingestion_worker_secrets.url, "orchestrator")
 _doc_generation_client = InternalApiClient(doc_generation_worker_secrets.url, "orchestrator")
+_image_generation_client = InternalApiClient(image_generation_worker_secrets.url, "orchestrator")
 
 _PAUSE_TOOL_NAMES = actions.ASYNC_TOOL_NAMES | actions.CONFIRM_TOOL_NAMES
 
@@ -202,6 +217,8 @@ async def _kick_off_pending_tool(
         await _kick_off_extraction(pg, mqtt, conversation, channel, user_id, channel_conversation_id, attachments, result, tool_use)
     elif name == "generate_document":
         await _kick_off_generation(pg, mqtt, conversation, channel, user_id, channel_conversation_id, attachments, result, tool_use)
+    elif name == "generate_image":
+        await _kick_off_image_generation(pg, mqtt, conversation, channel, user_id, channel_conversation_id, attachments, result, tool_use)
     elif name in actions.CONFIRM_TOOL_NAMES:
         await _kick_off_confirmation(pg, mqtt, conversation, channel, user_id, channel_conversation_id, attachments, result, tool_use)
     else:
@@ -237,6 +254,26 @@ async def _kick_off_extraction(
         await reply_raw(mqtt, channel, user_id, channel_conversation_id, "No he recibido ninguna foto que analizar — vuelve a intentarlo.")
         return
 
+    # `pending_agent_turn` carries the pending tool_use_id itself (not just a
+    # boolean) — resume_agent_loop resolves `resolved_tool_results` by that id
+    # once the callback below has the extraction result. `pending_attachments`
+    # keeps the original message's attachments around across however many more
+    # pause/resume round trips this message ends up needing (one per attachment).
+    #
+    # Persisted BEFORE firing the request, not after: doc-ingestion-worker's
+    # callback can otherwise race ahead of this write (plausible once its own
+    # work is fast) and find no pending_agent_turn yet, silently dropping the
+    # result (handle_doc_ingestion_result's "no pending turn — dropping") and
+    # leaving the conversation stuck forever waiting for a callback that
+    # already happened and was ignored.
+    paused_state = {
+        **conversation["state"],
+        "history": result.messages,
+        "pending_agent_turn": tool_use["id"],
+        "pending_attachments": [a.model_dump() for a in attachments],
+    }
+    await update_state(pg, conversation["id"], paused_state)
+
     request = DocIngestionRequest(
         conversation_id=str(conversation["id"]),
         channel_conversation_id=channel_conversation_id,
@@ -248,22 +285,12 @@ async def _kick_off_extraction(
     # via POST /internal/doc-ingestion/result (see handle_doc_ingestion_result).
     response = await _doc_ingestion_client.post("/extract", json=request.model_dump())
     if response is None:
-        # InternalApiClient already logged the failure after its own retries.
+        # Dispatch never happened — no callback is ever coming, so revert the
+        # pending state instead of leaving the conversation stuck waiting for one.
+        await update_state(pg, conversation["id"], {**conversation["state"], "history": result.messages})
         await reply_raw(mqtt, channel, user_id, channel_conversation_id, "No puedo procesar la foto ahora mismo — inténtalo de nuevo en un momento.")
         return
 
-    # `pending_agent_turn` carries the pending tool_use_id itself (not just a
-    # boolean) — resume_agent_loop resolves `resolved_tool_results` by that id
-    # once the callback below has the extraction result. `pending_attachments`
-    # keeps the original message's attachments around across however many more
-    # pause/resume round trips this message ends up needing (one per attachment).
-    new_state = {
-        **conversation["state"],
-        "history": result.messages,
-        "pending_agent_turn": tool_use["id"],
-        "pending_attachments": [a.model_dump() for a in attachments],
-    }
-    await update_state(pg, conversation["id"], new_state)
     await reply_raw(mqtt, channel, user_id, channel_conversation_id, result.final_text or "Recibido. Dame un momento para analizar la foto...")
 
 
@@ -281,6 +308,20 @@ async def _kick_off_generation(
     """Fires the actual `/generate` request for the `generate_document` tool
     call the loop just paused on — the model has already written the file's
     content, this only asks doc-generation-worker to render it into bytes."""
+    # Persisted BEFORE firing the request, not after: doc-generation-worker's
+    # rendering is pure local CPU (no external API call), fast enough that its
+    # callback can race ahead of this write and find no pending_agent_turn yet
+    # — silently dropped by handle_doc_generation_result ("no pending turn —
+    # dropping"), leaving the conversation stuck forever waiting for a
+    # callback that already happened and was ignored.
+    paused_state = {
+        **conversation["state"],
+        "history": result.messages,
+        "pending_agent_turn": tool_use["id"],
+        "pending_attachments": [a.model_dump() for a in attachments],
+    }
+    await update_state(pg, conversation["id"], paused_state)
+
     request = DocGenerationRequest(
         conversation_id=str(conversation["id"]),
         channel_conversation_id=channel_conversation_id,
@@ -292,17 +333,126 @@ async def _kick_off_generation(
     )
     response = await _doc_generation_client.post("/generate", json=request.model_dump())
     if response is None:
+        # Dispatch never happened — no callback is ever coming, so revert the
+        # pending state instead of leaving the conversation stuck waiting for one.
+        await update_state(pg, conversation["id"], {**conversation["state"], "history": result.messages})
         await reply_raw(mqtt, channel, user_id, channel_conversation_id, "No puedo generar el documento ahora mismo — inténtalo de nuevo en un momento.")
         return
 
-    new_state = {
+    await reply_raw(mqtt, channel, user_id, channel_conversation_id, result.final_text or "Generando tu documento, dame un momento...")
+
+
+def _image_filename(name: str) -> str:
+    """Same sanitization as image-generation-worker's own `_safe_filename` —
+    kept in sync deliberately rather than shared, since this one only ever
+    handles the "reuse an existing photo" path, not a whole service."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", name).strip("_").lower()
+    return (slug or "imagen") + ".jpg"
+
+
+async def _fetch_existing_device_photo(url_or_ref: str) -> tuple[bytes, str] | None:
+    """Resolves a `device_document.url_or_ref` into real bytes — decodes it
+    directly if it's already a `data:` URI, downloads it if it's a URL. The
+    download also doubles as a reachability check: a Telegram file URL
+    attached a while ago may well have expired by now (Telegram's own file
+    links are short-lived), so this returns `None` on any failure instead of
+    letting a stale reference break the reply — the caller falls back to
+    search/generation exactly as if no photo had ever been on file.
+
+    Not re-encoded to JPEG here (unlike image-generation-worker's own
+    `convert.py`) — a deliberate simplification: every photo Telegram itself
+    forwards is always already a real JPEG (Telegram re-encodes any photo it
+    receives), which covers the overwhelming majority of attached device
+    photos in practice; only a non-Telegram (web-adapter) upload could be a
+    different format, an edge case not worth a second Pillow dependency for.
+    """
+    try:
+        if url_or_ref.startswith("data:"):
+            header, _, b64_data = url_or_ref.partition(",")
+            media_type = header.removeprefix("data:").split(";")[0] or "image/jpeg"
+            return base64.b64decode(b64_data), media_type
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url_or_ref, follow_redirects=True)
+            response.raise_for_status()
+            media_type = response.headers.get("content-type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
+            return response.content, media_type
+    except Exception:
+        logger.warning("Existing device photo at %r isn't fetchable anymore — falling back to search/generation.", url_or_ref[:200])
+        return None
+
+
+async def _kick_off_image_generation(
+    pg: PostgrestClient,
+    mqtt: ManagedMqttConnection,
+    conversation: dict[str, Any],
+    channel: str,
+    user_id: str,
+    channel_conversation_id: str,
+    attachments: list[Attachment],
+    result: AgentTurnResult,
+    tool_use: dict[str, Any],
+) -> None:
+    """Handles the `generate_image` tool call the loop just paused on.
+
+    If `device_id` was given and a photo is already attached to that device
+    (and still fetchable), reuses it immediately — resolves the tool call
+    right here with no worker round trip, same as an instant, already-decided
+    confirmation. Otherwise fires the actual `/generate-image` request:
+    image-generation-worker tries a real image search first, falls back to
+    Gemini generation, and always normalizes that result to JPEG before
+    calling back."""
+    device_id = tool_use["input"].get("device_id")
+    if device_id:
+        existing = await registry.get_latest_device_photo(pg, device_id)
+        fetched = await _fetch_existing_device_photo(existing["url_or_ref"]) if existing else None
+        if fetched is not None:
+            data, media_type = fetched
+            filename = _image_filename(tool_use["input"]["filename"])
+            attachment = Attachment(
+                kind=AttachmentKind.IMAGE,
+                media_type=media_type,
+                url_or_data=f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}",
+                filename=filename,
+            )
+            tool_result = {"success": True, "filename": filename, "source": "existing"}
+            agent_result = await _resume_agent_loop(pg, result.messages, {tool_use["id"]: tool_result})
+            await _finish_paused_turn(
+                pg, mqtt, conversation, channel, user_id, channel_conversation_id, agent_result, attachment=attachment
+            )
+            return
+
+    # Persisted BEFORE firing the request, not after — same race condition
+    # `_kick_off_generation` guards against: a fast enough response (a real
+    # search hit needs no generation at all) can otherwise race ahead of this
+    # write and find no pending_agent_turn yet, silently dropped by
+    # handle_image_generation_result ("no pending turn — dropping"), leaving
+    # the conversation stuck forever waiting for a callback that already
+    # happened and was ignored.
+    paused_state = {
         **conversation["state"],
         "history": result.messages,
         "pending_agent_turn": tool_use["id"],
         "pending_attachments": [a.model_dump() for a in attachments],
     }
-    await update_state(pg, conversation["id"], new_state)
-    await reply_raw(mqtt, channel, user_id, channel_conversation_id, result.final_text or "Generando tu documento, dame un momento...")
+    await update_state(pg, conversation["id"], paused_state)
+
+    request = ImageRequest(
+        conversation_id=str(conversation["id"]),
+        channel_conversation_id=channel_conversation_id,
+        channel=channel,
+        user_id=user_id,
+        query=tool_use["input"]["query"],
+        filename=tool_use["input"]["filename"],
+    )
+    response = await _image_generation_client.post("/generate-image", json=request.model_dump())
+    if response is None:
+        # Dispatch never happened — no callback is ever coming, so revert the
+        # pending state instead of leaving the conversation stuck waiting for one.
+        await update_state(pg, conversation["id"], {**conversation["state"], "history": result.messages})
+        await reply_raw(mqtt, channel, user_id, channel_conversation_id, "No puedo conseguir la imagen ahora mismo — inténtalo de nuevo en un momento.")
+        return
+
+    await reply_raw(mqtt, channel, user_id, channel_conversation_id, result.final_text or "Buscando la imagen, dame un momento...")
 
 
 async def _kick_off_confirmation(
@@ -360,14 +510,17 @@ async def _finish_paused_turn(
     attachment: Attachment | None = None,
 ) -> None:
     """Shared tail end for every resume path (doc-ingestion callback,
-    doc-generation callback, and approval callback): deliver a just-rendered
-    file if there is one, then either continue the chain (another attachment
-    or action the model wants to handle next) or close out the turn."""
+    doc-generation callback, image-generation callback, and approval
+    callback): deliver a just-rendered file/image if there is one, then
+    either continue the chain (another attachment or action the model wants
+    to handle next) or close out the turn."""
     if attachment is not None:
-        # The file is ready now — send it as soon as it's ready, regardless of
-        # whatever the model wants to do next in this same resumed turn.
+        # The file/image is ready now — send it as soon as it's ready,
+        # regardless of whatever the model wants to do next in this same
+        # resumed turn.
+        default_text = "Aquí tienes tu imagen." if attachment.kind == AttachmentKind.IMAGE else "Aquí tienes tu documento."
         await reply_raw(
-            mqtt, channel, user_id, channel_conversation_id, agent_result.final_text or "Aquí tienes tu documento.", attachments=[attachment]
+            mqtt, channel, user_id, channel_conversation_id, agent_result.final_text or default_text, attachments=[attachment]
         )
 
     if not agent_result.done:
@@ -406,7 +559,7 @@ async def _finish_paused_turn(
         await reply_raw(mqtt, channel, user_id, channel_conversation_id, agent_result.final_text or llm.DEFAULT_DONE_FALLBACK)
 
 
-# --- Internal HTTP API (doc-ingestion-worker, doc-generation-worker) -------
+# --- Internal HTTP API (doc-ingestion-worker, doc-generation-worker, image-generation-worker) ---
 
 
 async def handle_doc_ingestion_result(request: web.Request) -> web.Response:
@@ -473,11 +626,46 @@ async def handle_doc_generation_result(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_image_generation_result(request: web.Request) -> web.Response:
+    pg: PostgrestClient = request.app["pg"]
+    body = await request.json()
+    result = ImageResult.model_validate(body)
+    conversation = await get_conversation_by_id(pg, result.conversation_id)
+    pending_tool_use_id = conversation["state"].get("pending_agent_turn")
+    if not pending_tool_use_id:
+        logger.warning(
+            "image-generation callback for conversation %s with no pending turn — dropping", result.conversation_id
+        )
+        return web.json_response({"ok": False})
+
+    attachment: Attachment | None = None
+    if result.success and result.data_base64:
+        tool_result: Any = {"success": True, "filename": result.filename, "source": result.source}
+        attachment = Attachment(
+            kind=AttachmentKind.IMAGE,
+            media_type="image/jpeg",
+            url_or_data=f"data:image/jpeg;base64,{result.data_base64}",
+            filename=result.filename,
+        )
+    else:
+        tool_result = {"success": False, "error": result.error or "unknown error"}
+
+    agent_result = await _resume_agent_loop(
+        pg, conversation["state"].get("history", []), {pending_tool_use_id: tool_result}
+    )
+    await _finish_paused_turn(
+        pg, _mqtt, conversation, result.channel, result.user_id, result.channel_conversation_id, agent_result, attachment=attachment
+    )
+
+    return web.json_response({"ok": True})
+
+
 def build_app(pg: PostgrestClient) -> web.Application:
     app = web.Application()
     app["pg"] = pg
     app.router.add_post("/internal/doc-ingestion/result", handle_doc_ingestion_result)
     app.router.add_post("/internal/doc-generation/result", handle_doc_generation_result)
+    app.router.add_post("/internal/image/result", handle_image_generation_result)
     return app
 
 
@@ -525,6 +713,7 @@ async def _run() -> None:
         await pg.aclose()
         await _doc_ingestion_client.aclose()
         await _doc_generation_client.aclose()
+        await _image_generation_client.aclose()
 
 
 if __name__ == "__main__":
